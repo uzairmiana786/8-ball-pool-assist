@@ -92,25 +92,62 @@ object Vision {
      * Can confuse striped balls, so auto shoot must remain guarded.
      */
     fun findCueBall(bitmap:Bitmap, found:List<Ball>):Ball? {
-        var best:Ball?=null
-        var bestScore=0f
+        if(found.isEmpty())return null
+
+        // A plain white ball cannot reliably be differentiated from striped balls
+        // using brightness alone. Prefer the endpoint of the long game cue stick.
+        val src=Mat()
+        val gray=Mat()
+        val edges=Mat()
+        val segments=Mat()
+        val longLines=mutableListOf<FloatArray>()
+        try {
+            Utils.bitmapToMat(bitmap,src)
+            Imgproc.cvtColor(src,gray,Imgproc.COLOR_RGBA2GRAY)
+            Imgproc.Canny(gray,edges,65.0,145.0)
+            Imgproc.HoughLinesP(edges,segments,1.0,Math.PI/180.0,55,75.0,12.0)
+            for(i in 0 until segments.rows()){
+                val points=segments.get(i,0) ?: continue
+                if(points.size>=4)longLines.add(floatArrayOf(points[0].toFloat(),points[1].toFloat(),points[2].toFloat(),points[3].toFloat()))
+            }
+        } finally {
+            src.release();gray.release();edges.release();segments.release()
+        }
+        fun nearStickTip(ball:Ball):Boolean {
+            for(line in longLines){
+                val x1=line[0];val y1=line[1];val x2=line[2];val y2=line[3]
+                val vx=x2-x1;val vy=y2-y1
+                val len=hypot(vx,vy)
+                if(len<ball.r*7f)continue
+                val d1=hypot(ball.x-x1,ball.y-y1)
+                val d2=hypot(ball.x-x2,ball.y-y2)
+                val endX=if(d1<d2)x1 else x2
+                val endY=if(d1<d2)y1 else y2
+                val dirX=if(d1<d2)vx/len else -vx/len
+                val dirY=if(d1<d2)vy/len else -vy/len
+                val dx=ball.x-endX;val dy=ball.y-endY
+                val along=dx*dirX+dy*dirY
+                val across=abs(dx*dirY-dy*dirX)
+                if(min(d1,d2)<ball.r*2.6f && across<ball.r && along<ball.r*.3f)
+                    return true
+            }
+            return false
+        }
         val offsets=listOf(
             0f to 0f, -.25f to 0f, .25f to 0f, 0f to -.25f, 0f to .25f,
             -.45f to 0f, .45f to 0f, 0f to -.45f, 0f to .45f,
             -.3f to -.3f, -.3f to .3f, .3f to -.3f, .3f to .3f
         )
+        var best:Ball?=null
+        var bestScore=.95f
         for(ball in found){
-            var white=0
-            var count=0
-            var colored=0
+            var white=0;var count=0;var colored=0
             for((dx,dy) in offsets){
                 val x=(ball.x+dx*ball.r).toInt()
                 val y=(ball.y+dy*ball.r).toInt()
                 if(x<0 || y<0 || x>=bitmap.width || y>=bitmap.height)continue
-                val color=bitmap.getPixel(x,y)
-                val r=Color.red(color)
-                val g=Color.green(color)
-                val b=Color.blue(color)
+                val pixel=bitmap.getPixel(x,y)
+                val r=Color.red(pixel);val g=Color.green(pixel);val b=Color.blue(pixel)
                 val spread=max(r,max(g,b))-min(r,min(g,b))
                 val brightness=(r+g+b)/3
                 if(brightness>165 && spread<53)white++
@@ -118,10 +155,15 @@ object Vision {
                 count++
             }
             if(count==0)continue
-            val score=(white-colored*.6f)/count
-            if(score>bestScore){bestScore=score;best=ball}
+            val whiteScore=(white-colored*.6f)/count
+            val hasStick=nearStickTip(ball)
+            val score=whiteScore+(if(hasStick)1.1f else 0f)
+            if(score>bestScore && (hasStick || whiteScore>.95f)){
+                bestScore=score
+                best=ball
+            }
         }
-        return best?.takeIf{bestScore>=.48f}
+        return best
     }
 
     private fun segmentDistance(b:Ball,x:Float,y:Float,xx:Float,yy:Float):Float {
