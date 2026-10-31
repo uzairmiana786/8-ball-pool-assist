@@ -59,18 +59,27 @@ object Vision {
             Imgproc.cvtColor(src,gray,Imgproc.COLOR_RGBA2GRAY)
             Imgproc.GaussianBlur(gray,gray,Size(5.0,5.0),1.2)
             val expectedRadius=table.width()/67f
-            Imgproc.HoughCircles(
-                gray,circles,Imgproc.HOUGH_GRADIENT,
-                1.0,max(7.0,(expectedRadius*1.7).toDouble()),
-                105.0,20.0,
-                max(4,(expectedRadius*.72).toInt()),
-                max(5,(expectedRadius*1.35).toInt())
-            )
+            // Hough detection must operate on the pool cloth, NOT the entire
+            // landscape frame (which contains lots of HUD circular icons).
+            val left=table.left.toInt().coerceIn(0,gray.cols()-2)
+            val top=table.top.toInt().coerceIn(0,gray.rows()-2)
+            val right=table.right.toInt().coerceIn(left+2,gray.cols())
+            val bottom=table.bottom.toInt().coerceIn(top+2,gray.rows())
+            val crop=gray.submat(org.opencv.core.Rect(left,top,right-left,bottom-top))
+            try {
+                Imgproc.HoughCircles(
+                    crop,circles,Imgproc.HOUGH_GRADIENT,
+                    1.0,max(7.0,(expectedRadius*1.7).toDouble()),
+                    105.0,20.0,
+                    max(4,(expectedRadius*.72).toInt()),
+                    max(5,(expectedRadius*1.35).toInt())
+                )
+            } finally { crop.release() }
             val found=mutableListOf<Ball>()
             for(i in 0 until circles.cols()) {
                 val v=circles.get(0,i) ?: continue
-                val x=v[0].toFloat()
-                val y=v[1].toFloat()
+                val x=v[0].toFloat()+left
+                val y=v[1].toFloat()+top
                 val r=v[2].toFloat()
                 if(!table.contains(x,y)) continue
                 if(x-r<table.left || x+r>table.right || y-r<table.top || y+r>table.bottom) continue
@@ -107,14 +116,23 @@ object Vision {
             Utils.bitmapToMat(bitmap,src)
             Imgproc.cvtColor(src,gray,Imgproc.COLOR_RGBA2GRAY)
             Imgproc.Canny(gray,edges,65.0,145.0)
-            Imgproc.HoughLinesP(edges,segments,1.0,Math.PI/180.0,55,75.0,12.0)
+            // Keep a margin for wooden cue entering from below/side, while
+            // avoiding HUD edges and other expensive full-screen Hough lines.
+            val left=(playingSurface.left-20f).toInt().coerceIn(0,edges.cols()-2)
+            val top=(playingSurface.top-20f).toInt().coerceIn(0,edges.rows()-2)
+            val right=(playingSurface.right+20f).toInt().coerceIn(left+2,edges.cols())
+            val bottom=(playingSurface.bottom+20f).toInt().coerceIn(top+2,edges.rows())
+            val roi=edges.submat(org.opencv.core.Rect(left,top,right-left,bottom-top))
+            try {
+                Imgproc.HoughLinesP(roi,segments,1.0,Math.PI/180.0,52,60.0,12.0)
+            } finally { roi.release() }
             for(i in 0 until segments.rows()) {
                 val points=segments.get(i,0) ?: continue
                 if(points.size<4)continue
-                val x1=points[0].toFloat();val y1=points[1].toFloat()
-                val x2=points[2].toFloat();val y2=points[3].toFloat()
+                val x1=points[0].toFloat()+left;val y1=points[1].toFloat()+top
+                val x2=points[2].toFloat()+left;val y2=points[3].toFloat()+top
                 val lineLength=hypot(x2-x1,y2-y1)
-                if(lineLength<70f)continue
+                if(lineLength<60f)continue
                 val mx=((x1+x2)*.5f).toInt()
                 val my=((y1+y2)*.5f).toInt()
                 if(mx<0 || my<0 || mx>=bitmap.width || my>=bitmap.height)continue
