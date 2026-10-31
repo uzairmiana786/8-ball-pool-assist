@@ -40,6 +40,8 @@ class LiveService: Service() {
     private var autoLive=true
     private var lastFrame=0L
     private var missed=0
+    private var framesProcessed=0L
+    private var lastProcessingMs=0L
     @Volatile private var stopped=false
     @Volatile private var pending=false
     @Volatile private var processing=false
@@ -108,11 +110,34 @@ class LiveService: Service() {
                     pending=false
                     processing=true
                     val frameTime=SystemClock.elapsedRealtime()
+                    val startNs=SystemClock.elapsedRealtimeNanos()
                     val plane=image.planes[0]
                     val buffer=plane.buffer
-                    val pixels=IntArray(image.width*image.height)
-                    for(y in 0 until image.height){
-                        for(x in 0 until image.width){
+                    // Bulk native pixel copy (usually a few milliseconds).
+                    // The previous Java per-channel loop performed over four
+                    // million ByteBuffer reads per captured screen.
+                    val raw:Bitmap
+                    if(plane.pixelStride==4 && plane.rowStride%4==0) {
+                        val paddedWidth=plane.rowStride/4
+                        val padded=Bitmap.createBitmap(paddedWidth,image.height,Bitmap.Config.ARGB_8888)
+                        buffer.rewind()
+                        val required=plane.rowStride.toLong()*image.height
+                        if(buffer.remaining().toLong()>=required) {
+                            padded.copyPixelsFromBuffer(buffer)
+                        }else{
+                            // Last-row padding is not guaranteed on every Android driver.
+                            val bytes=ByteArray(required.toInt())
+                            buffer.get(bytes,0,min(bytes.size,buffer.remaining()))
+                            padded.copyPixelsFromBuffer(java.nio.ByteBuffer.wrap(bytes))
+                        }
+                        if(paddedWidth==image.width) raw=padded
+                        else {
+                            raw=Bitmap.createBitmap(padded,0,0,image.width,image.height)
+                            padded.recycle()
+                        }
+                    }else{
+                        val pixels=IntArray(image.width*image.height)
+                        for(y in 0 until image.height)for(x in 0 until image.width){
                             val index=y*plane.rowStride+x*plane.pixelStride
                             if(index+3>=buffer.limit())continue
                             pixels[y*image.width+x]=Color.argb(
@@ -121,9 +146,9 @@ class LiveService: Service() {
                                 buffer.get(index+1).toInt() and 255,
                                 buffer.get(index+2).toInt() and 255)
                         }
+                        raw=Bitmap.createBitmap(pixels,image.width,image.height,Bitmap.Config.ARGB_8888)
                     }
-                    val raw=Bitmap.createBitmap(pixels,image.width,image.height,Bitmap.Config.ARGB_8888)
-                    val scale=min(1f,1152f/image.width)
+                    val scale=min(1f,1024f/image.width)
                     val scaled=Bitmap.createScaledBitmap(raw,
                         max(1,(image.width*scale).toInt()),
                         max(1,(image.height*scale).toInt()),true)
@@ -152,9 +177,12 @@ class LiveService: Service() {
                         if(scaled!==raw)scaled.recycle()
                         raw.recycle()
                     }
+                    val workMs=(SystemClock.elapsedRealtimeNanos()-startNs)/1_000_000L
                     main.post {
                         try {
                             if(!stopped) {
+                                lastProcessingMs=workMs
+                                framesProcessed++
                                 lastFrame=frameTime
                                 update(results.first,results.second,results.third)
                                 drawing.visibility=View.VISIBLE
@@ -164,8 +192,9 @@ class LiveService: Service() {
                 }catch(e:Exception){
                     main.post {
                         if(!stopped){
+                            pending=false
                             live=null
-                            status.text="Capture/vision error: ${e.javaClass.simpleName}"
+                            status.text="VISION ERROR: ${e.javaClass.simpleName} • restart screen capture"
                             drawing.visibility=View.VISIBLE
                             drawing.invalidate()
                         }
@@ -197,14 +226,17 @@ class LiveService: Service() {
             } else if(pending && SystemClock.elapsedRealtime()-requestedAt>4500L) {
                 pending=false
                 live=null
-                status.text="Waiting for a fresh screen frame"
+                status.text="NO NEW SCREEN FRAME (4.5s) • restart with Entire screen"
                 drawing.visibility=View.VISIBLE
             }
             if(SystemClock.elapsedRealtime()-lastFrame>5000L && lastFrame>0L){
                 live=null
                 if(!pending)drawing.invalidate()
             }
-            main.postDelayed(this,300L)
+            if(processing && SystemClock.elapsedRealtime()-lastFrame>6000L && lastFrame>0L){
+                status.text="Vision is processing slowly • ${lastProcessingMs}ms/frame"
+            }
+            main.postDelayed(this,220L)
         }
     }
 
@@ -241,11 +273,11 @@ class LiveService: Service() {
         } else null
         status.text=when {
             !autoLive -> "Auto Live OFF"
-            c==null -> "Scanning white cue ball and stick • ${detected.size} circles"
-            d==null -> "Cue ball seen • searching stick angle"
+            c==null -> "SCAN ${detected.size} balls • searching white cue and wooden stick • frame ${framesProcessed}"
+            d==null -> "Cue found • searching current stick angle • ${lastProcessingMs}ms"
             live==null -> "Aim direction unavailable"
-            live!!.hitBall!=null -> "LIVE • first ball collision and outgoing path"
-            else -> "LIVE • cushion path (no ball in aim ray)"
+            live!!.hitBall!=null -> "LIVE • ball collision path • ${lastProcessingMs}ms/frame"
+            else -> "LIVE • cue ray + cushion • ${lastProcessingMs}ms/frame"
         }
         drawing.invalidate()
     }
