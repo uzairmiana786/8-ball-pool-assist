@@ -16,12 +16,11 @@ class MainActivity:Activity(){
   val scroll=ScrollView(this);scroll.addView(layout);setContentView(scroll)
   fun label(s:String){layout.addView(TextView(this).apply{text=s;textSize=18f;setPadding(0,12,0,12)})}
   fun button(s:String,action:()->Unit){layout.addView(Button(this).apply{text=s;setOnClickListener{action()}})}
-  label("POOL VISION • Shot Paths 0.7")
-  label("Experimental 0.7: Pick Target once, app attempts a direct-pocket route. Yellow = cue to ghost contact; green = target to pocket; cyan = estimated live cue direction; red dashed = BLOCKED route (do not shoot). No pot guarantees. Start in landscape and share ENTIRE screen.")
-  label("Accessibility sends only the aim tap and calibrated power swipe when you press Aim + Shoot. Screen frames stay in memory; no uploads or recordings. Turn this service off in Android settings whenever you wish.")
+  label("POOL VISION • Auto Live ESP 0.8")
+  label("Experimental 0.8: NO table, cue, target or pocket taps. Rotate your cue stick in the game to see a thick cyan aiming ray, green object-ball trajectory and magenta cushion reflection. Requires visually detected white cue and wooden stick. Spin, force and game physics are not modeled. Start in landscape and share ENTIRE screen.")
+  label("Read-only on-screen prediction: this build does NOT aim or shoot for you. Android Accessibility gestures are not needed. Screen frames are processed locally in memory.")
   button("1 • Allow floating controls"){startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,Uri.parse("package:$packageName")))}
-  button("2 • Enable Pool Vision gestures"){startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))}
-  button("3 • Start screen capture"){
+  button("2 • Start AUTO LIVE screen capture"){
    if(!Settings.canDrawOverlays(this))Toast.makeText(this,"Allow floating controls first",Toast.LENGTH_LONG).show()
    else if(!OpenCVLoader.initLocal())Toast.makeText(this,"OpenCV could not load",Toast.LENGTH_LONG).show()
    else startActivityForResult((getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager).createScreenCaptureIntent(),40)
