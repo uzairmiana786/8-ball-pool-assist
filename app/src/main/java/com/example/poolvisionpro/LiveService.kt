@@ -138,7 +138,7 @@ class LiveService: Service() {
                             obscured.contains(
                                 b.x*screenW/scaled.width,b.y*screenH/scaled.height)
                         }
-                        val detection=Vision.findCueBallAndDirection(scaled,candidates)
+                        val detection=Vision.findCueBallAndDirection(scaled,candidates,bounds)
                         val balls=candidates.map { b ->
                             Ball(b.x*screenW/scaled.width,b.y*screenH/scaled.height,
                                 b.r*screenW/scaled.width)
