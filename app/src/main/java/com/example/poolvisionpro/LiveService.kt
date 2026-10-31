@@ -225,16 +225,19 @@ class LiveService:Service(){
   val params=WindowManager.LayoutParams(min(dp(285),screenW/2),-2,WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,PixelFormat.TRANSLUCENT).apply{gravity=Gravity.TOP or Gravity.START;x=0;y=0}
   panelParams=params
   fun updatePanelRect(){
+   if(box.width<=0 || box.height<=0)return
+   val location=IntArray(2)
+   box.getLocationOnScreen(location)
    panelRect=RectF(
-    params.x.toFloat(),params.y.toFloat(),
-    (params.x+box.width).toFloat(),(params.y+box.height).toFloat()
+    location[0].toFloat(), location[1].toFloat(),
+    (location[0]+box.width).toFloat(),(location[1]+box.height).toFloat()
    )
   }
   box.addOnLayoutChangeListener{_,_,_,_,_,_,_,_,_->updatePanelRect()}
   var startX=0f;var startY=0f;var px=0;var py=0
   header.setOnTouchListener{_,e->when(e.actionMasked){
    MotionEvent.ACTION_DOWN->{startX=e.rawX;startY=e.rawY;px=params.x;py=params.y}
-   MotionEvent.ACTION_MOVE->{params.x=(px+e.rawX-startX).toInt().coerceIn(0,max(0,screenW-box.width));params.y=(py+e.rawY-startY).toInt().coerceIn(0,max(0,screenH-box.height));wm.updateViewLayout(box,params);updatePanelRect()}
+   MotionEvent.ACTION_MOVE->{params.x=(px+e.rawX-startX).toInt().coerceIn(0,max(0,screenW-box.width));params.y=(py+e.rawY-startY).toInt().coerceIn(0,max(0,screenH-box.height));wm.updateViewLayout(box,params);box.post{updatePanelRect()}}
   };true}
   wm.addView(box,params)
  }
