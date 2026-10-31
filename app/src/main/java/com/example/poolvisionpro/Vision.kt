@@ -220,13 +220,20 @@ object Vision {
 
     fun bestPocketPlan(c:Ball,t:Ball,all:List<Ball>,table:RectF):Plan? {
         val midX=(table.left+table.right)*.5f
+        // Calibration rectangle describes the blue playing cloth, not the
+        // centers of the pocket openings. Move targets outward from the rails.
+        val radius=table.width()/67f
+        val leftPocket=table.left-radius*.8f
+        val rightPocket=table.right+radius*.8f
+        val topPocket=table.top-radius*1.65f
+        val bottomPocket=table.bottom+radius*1.8f
         val pockets=listOf(
-            PointF(table.left,table.top),
-            PointF(midX,table.top),
-            PointF(table.right,table.top),
-            PointF(table.left,table.bottom),
-            PointF(midX,table.bottom),
-            PointF(table.right,table.bottom)
+            PointF(leftPocket,topPocket),
+            PointF(midX,topPocket),
+            PointF(rightPocket,topPocket),
+            PointF(leftPocket,bottomPocket),
+            PointF(midX,bottomPocket),
+            PointF(rightPocket,bottomPocket)
         )
         return pockets.mapNotNull{p->
             val candidate=plan(c,t,p,all,table) ?: return@mapNotNull null
