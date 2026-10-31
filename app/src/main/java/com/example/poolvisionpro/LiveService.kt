@@ -312,7 +312,7 @@ class LiveService: Service() {
             setBackgroundColor(Color.rgb(13,22,37))
         }
         val title=TextView(this).apply {
-            text="POOL VISION 0.8 • drag"
+            text="POOL VISION 0.8.2 • drag"
             setTextColor(Color.CYAN)
             textSize=13f
             setPadding(0,0,0,dp(4))

@@ -9,8 +9,8 @@ android {
         applicationId = "com.example.poolvisionpro"
         minSdk = 26
         targetSdk = 35
-        versionCode = 6
-        versionName = "0.8-autolive"
+        versionCode = 7
+        versionName = "0.8.2-framefix"
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
