@@ -170,7 +170,7 @@ object Vision {
                 }
                 // Ball should lie in front of (not on top of) the wooden segment.
                 if(outside<ball.r*.5f || outside>max(25f*ball.r,210f))continue
-                if(across>ball.r*1.3f)continue
+                if(across>ball.r*.95f)continue
                 val score=(outside/ball.r)+(across/ball.r)*3f-whiteScore*5f
                 if(score<bestScore){
                     val farX=if(along<0f)x2 else x1
