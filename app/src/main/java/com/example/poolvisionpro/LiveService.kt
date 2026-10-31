@@ -195,7 +195,7 @@ class LiveService:Service(){
   drawing=Guide();wm.addView(drawing,fullParams(false))
   fun dp(v:Int)=(v*resources.displayMetrics.density).toInt()
   val box=LinearLayout(this).apply{orientation=1;setPadding(dp(4),dp(2),dp(4),dp(2));setBackgroundColor(Color.rgb(12,22,38))}
-  val header=TextView(this).apply{text="POOL VISION 0.6 • drag here";textSize=12f;setTextColor(Color.CYAN);setPadding(8,8,8,8)}
+  val header=TextView(this).apply{text="POOL VISION 0.7 • drag here";textSize=12f;setTextColor(Color.CYAN);setPadding(8,8,8,8)}
   box.addView(header)
   val body=LinearLayout(this).apply{orientation=1};box.addView(body)
   status=TextView(this).apply{setTextColor(Color.WHITE);textSize=10f;text="Table → Cue → Target → Pocket"};body.addView(status)
