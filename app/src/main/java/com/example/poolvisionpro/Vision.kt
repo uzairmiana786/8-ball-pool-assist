@@ -92,56 +92,48 @@ object Vision {
      * Can confuse striped balls, so auto shoot must remain guarded.
      */
     fun findCueBallAndDirection(bitmap:Bitmap, found:List<Ball>):Pair<Ball?,PointF?> {
-        if(found.isEmpty())return Pair(null,null)
+        if(found.isEmpty()) return Pair(null,null)
 
-        // A plain white ball cannot reliably be differentiated from striped balls
-        // using brightness alone. Prefer the endpoint of the long game cue stick.
+        // Colored in-game aiming lines should not be treated as a physical cue stick.
+        // Identify longer brown cue-stick segments, then extrapolate them backward
+        // toward the whitish circular candidate nearest the wooden tip.
         val src=Mat()
         val gray=Mat()
         val edges=Mat()
         val segments=Mat()
-        val longLines=mutableListOf<FloatArray>()
+        val woodenLines=mutableListOf<FloatArray>()
         try {
             Utils.bitmapToMat(bitmap,src)
             Imgproc.cvtColor(src,gray,Imgproc.COLOR_RGBA2GRAY)
             Imgproc.Canny(gray,edges,65.0,145.0)
             Imgproc.HoughLinesP(edges,segments,1.0,Math.PI/180.0,55,75.0,12.0)
-            for(i in 0 until segments.rows()){
+            for(i in 0 until segments.rows()) {
                 val points=segments.get(i,0) ?: continue
-                if(points.size>=4)longLines.add(floatArrayOf(points[0].toFloat(),points[1].toFloat(),points[2].toFloat(),points[3].toFloat()))
+                if(points.size<4)continue
+                val x1=points[0].toFloat();val y1=points[1].toFloat()
+                val x2=points[2].toFloat();val y2=points[3].toFloat()
+                val lineLength=hypot(x2-x1,y2-y1)
+                if(lineLength<70f)continue
+                val mx=((x1+x2)*.5f).toInt()
+                val my=((y1+y2)*.5f).toInt()
+                if(mx<0 || my<0 || mx>=bitmap.width || my>=bitmap.height)continue
+                val pixel=bitmap.getPixel(mx,my)
+                val red=Color.red(pixel);val green=Color.green(pixel);val blue=Color.blue(pixel)
+                if(red>green+18 && green>blue+8 && red>75) {
+                    woodenLines.add(floatArrayOf(x1,y1,x2,y2))
+                }
             }
         } finally {
             src.release();gray.release();edges.release();segments.release()
         }
-        fun nearStickTip(ball:Ball):Boolean {
-            for(line in longLines){
-                val x1=line[0];val y1=line[1];val x2=line[2];val y2=line[3]
-                val vx=x2-x1;val vy=y2-y1
-                val len=hypot(vx,vy)
-                if(len<ball.r*7f)continue
-                val d1=hypot(ball.x-x1,ball.y-y1)
-                val d2=hypot(ball.x-x2,ball.y-y2)
-                val endX=if(d1<d2)x1 else x2
-                val endY=if(d1<d2)y1 else y2
-                val dirX=if(d1<d2)vx/len else -vx/len
-                val dirY=if(d1<d2)vy/len else -vy/len
-                val dx=ball.x-endX;val dy=ball.y-endY
-                val along=dx*dirX+dy*dirY
-                val across=abs(dx*dirY-dy*dirX)
-                if(min(d1,d2)<ball.r*2.6f && across<ball.r && along<ball.r*.3f)
-                    return true
-            }
-            return false
-        }
+
         val offsets=listOf(
             0f to 0f, -.25f to 0f, .25f to 0f, 0f to -.25f, 0f to .25f,
             -.45f to 0f, .45f to 0f, 0f to -.45f, 0f to .45f,
             -.3f to -.3f, -.3f to .3f, .3f to -.3f, .3f to .3f
         )
-        var best:Ball?=null
-        var bestScore=.95f
-        for(ball in found){
-            var white=0;var count=0;var colored=0
+        fun whiteness(ball:Ball):Float {
+            var white=0;var colored=0;var count=0
             for((dx,dy) in offsets){
                 val x=(ball.x+dx*ball.r).toInt()
                 val y=(ball.y+dy*ball.r).toInt()
@@ -154,54 +146,45 @@ object Vision {
                 if(spread>70 && brightness>85)colored++
                 count++
             }
-            if(count==0)continue
-            val whiteScore=(white-colored*.6f)/count
-            val hasStick=nearStickTip(ball)
-            val score=whiteScore+(if(hasStick)1.1f else 0f)
-            if(score>bestScore && (hasStick || whiteScore>.95f)){
-                bestScore=score
-                best=ball
-            }
+            return if(count==0)-1f else (white-colored*.6f)/count
         }
-        // Optional live cue-stick direction; null when we cannot distinguish the
-        // wooden cue from painted game guides. Never invent a live orientation.
-        var stickDirection:PointF?=null
-        var nearestScore=Float.POSITIVE_INFINITY
-        if(best!=null){
-            val ball=best
-            for(line in longLines){
+
+        var selected:Ball?=null
+        var direction:PointF?=null
+        var bestScore=Float.POSITIVE_INFINITY
+        for(ball in found) {
+            val whiteScore=whiteness(ball)
+            if(whiteScore<.10f)continue
+            for(line in woodenLines){
                 val x1=line[0];val y1=line[1];val x2=line[2];val y2=line[3]
-                val d1=hypot(ball.x-x1,ball.y-y1)
-                val d2=hypot(ball.x-x2,ball.y-y2)
-                val farX=if(d1<d2)x2 else x1
-                val farY=if(d1<d2)y2 else y1
-                val nearX=if(d1<d2)x1 else x2
-                val nearY=if(d1<d2)y1 else y2
-                val dx=ball.x-farX
-                val dy=ball.y-farY
-                val segmentLength=hypot(x2-x1,y2-y1)
-                if(min(d1,d2)>ball.r*2.5f || segmentLength<ball.r*7f)continue
-                val vx=(x2-x1)/segmentLength
-                val vy=(y2-y1)/segmentLength
-                val across=abs((ball.x-nearX)*vy-(ball.y-nearY)*vx)
-                if(across>ball.r*.85f)continue
-                val mx=((x1+x2)*.5f).toInt()
-                val my=((y1+y2)*.5f).toInt()
-                if(mx<0 || my<0 || mx>=bitmap.width || my>=bitmap.height)continue
-                val color=bitmap.getPixel(mx,my)
-                val red=Color.red(color);val green=Color.green(color);val blue=Color.blue(color)
-                // Brown wooden cues; otherwise decline rather than guess.
-                val looksLikeWood=red>green+12 && green>blue+5 && red>75
-                if(!looksLikeWood)continue
-                val score=min(d1,d2)+across
-                val magnitude=hypot(dx,dy)
-                if(score<nearestScore && magnitude>1f){
-                    stickDirection=PointF(dx/magnitude,dy/magnitude)
-                    nearestScore=score
+                val vx=x2-x1;val vy=y2-y1
+                val length=hypot(vx,vy)
+                if(length<1f)continue
+                val ux=vx/length;val uy=vy/length
+                val along=(ball.x-x1)*ux+(ball.y-y1)*uy
+                val across=abs((ball.x-x1)*uy-(ball.y-y1)*ux)
+                val outside=when {
+                    along<0f -> -along
+                    along>length -> along-length
+                    else -> 0f
+                }
+                // Ball should lie in front of (not on top of) the wooden segment.
+                if(outside<ball.r*.5f || outside>max(25f*ball.r,210f))continue
+                if(across>ball.r*1.3f)continue
+                val score=(outside/ball.r)+(across/ball.r)*3f-whiteScore*5f
+                if(score<bestScore){
+                    val farX=if(along<0f)x2 else x1
+                    val farY=if(along<0f)y2 else y1
+                    val dx=ball.x-farX;val dy=ball.y-farY
+                    val mag=hypot(dx,dy).coerceAtLeast(1f)
+                    direction=PointF(dx/mag,dy/mag)
+                    selected=ball
+                    bestScore=score
                 }
             }
         }
-        return Pair(best,stickDirection)
+        // No reliable wooden cue? Do not assume the brightest stripe is the cue.
+        return Pair(selected,direction)
     }
 
     private fun segmentDistance(b:Ball,x:Float,y:Float,xx:Float,yy:Float):Float {
