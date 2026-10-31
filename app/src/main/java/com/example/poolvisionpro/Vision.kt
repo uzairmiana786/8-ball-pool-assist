@@ -91,8 +91,8 @@ object Vision {
      * Among circular candidates, prefer a bright, low-saturation mostly-white ball.
      * Can confuse striped balls, so auto shoot must remain guarded.
      */
-    fun findCueBall(bitmap:Bitmap, found:List<Ball>):Ball? {
-        if(found.isEmpty())return null
+    fun findCueBallAndDirection(bitmap:Bitmap, found:List<Ball>):Pair<Ball?,PointF?> {
+        if(found.isEmpty())return Pair(null,null)
 
         // A plain white ball cannot reliably be differentiated from striped balls
         // using brightness alone. Prefer the endpoint of the long game cue stick.
@@ -163,7 +163,45 @@ object Vision {
                 best=ball
             }
         }
-        return best
+        // Optional live cue-stick direction; null when we cannot distinguish the
+        // wooden cue from painted game guides. Never invent a live orientation.
+        var stickDirection:PointF?=null
+        var nearestScore=Float.POSITIVE_INFINITY
+        if(best!=null){
+            val ball=best
+            for(line in longLines){
+                val x1=line[0];val y1=line[1];val x2=line[2];val y2=line[3]
+                val d1=hypot(ball.x-x1,ball.y-y1)
+                val d2=hypot(ball.x-x2,ball.y-y2)
+                val farX=if(d1<d2)x2 else x1
+                val farY=if(d1<d2)y2 else y1
+                val nearX=if(d1<d2)x1 else x2
+                val nearY=if(d1<d2)y1 else y2
+                val dx=ball.x-farX
+                val dy=ball.y-farY
+                val segmentLength=hypot(x2-x1,y2-y1)
+                if(min(d1,d2)>ball.r*2.5f || segmentLength<ball.r*7f)continue
+                val vx=(x2-x1)/segmentLength
+                val vy=(y2-y1)/segmentLength
+                val across=abs((ball.x-nearX)*vy-(ball.y-nearY)*vx)
+                if(across>ball.r*.85f)continue
+                val mx=((x1+x2)*.5f).toInt()
+                val my=((y1+y2)*.5f).toInt()
+                if(mx<0 || my<0 || mx>=bitmap.width || my>=bitmap.height)continue
+                val color=bitmap.getPixel(mx,my)
+                val red=Color.red(color);val green=Color.green(color);val blue=Color.blue(color)
+                // Brown wooden cues; otherwise decline rather than guess.
+                val looksLikeWood=red>green+12 && green>blue+5 && red>75
+                if(!looksLikeWood)continue
+                val score=min(d1,d2)+across
+                val magnitude=hypot(dx,dy)
+                if(score<nearestScore && magnitude>1f){
+                    stickDirection=PointF(dx/magnitude,dy/magnitude)
+                    nearestScore=score
+                }
+            }
+        }
+        return Pair(best,stickDirection)
     }
 
     private fun segmentDistance(b:Ball,x:Float,y:Float,xx:Float,yy:Float):Float {
@@ -191,6 +229,11 @@ object Vision {
         })return null
         return Plan(c,t,g,p)
     }
+
+    // Geometry-only preview when all direct routes are blocked by other balls.
+    // Caller MUST render this in red rather than as a reliable shot.
+    fun blockedRoutePreview(c:Ball,t:Ball,table:RectF):Plan? =
+        bestPocketPlan(c,t,emptyList(),table)
 
     fun bestPocketPlan(c:Ball,t:Ball,all:List<Ball>,table:RectF):Plan? {
         val midX=(table.left+table.right)*.5f
