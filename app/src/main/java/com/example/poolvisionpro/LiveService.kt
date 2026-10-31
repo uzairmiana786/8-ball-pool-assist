@@ -14,429 +14,475 @@ import android.widget.*
 import org.opencv.android.OpenCVLoader
 import kotlin.math.*
 
-class LiveService:Service(){
- private val main=Handler(Looper.getMainLooper())
- private val worker=HandlerThread("vision")
- private var projection:MediaProjection?=null
- private var reader:ImageReader?=null
- private var display:VirtualDisplay?=null
- private lateinit var wm:WindowManager
- private lateinit var drawing:Guide
- private var panel:LinearLayout?=null
- private lateinit var status:TextView
- private var screenW=0; private var screenH=0
- private var balls=listOf<Ball>();@Volatile private var table=RectF()
- private var cue:Ball?=null;private var target:Ball?=null;private var pocket:PointF?=null
- private var currentCueDirection:PointF?=null
- private var blockedPreview:Plan?=null
- private var powerStart:PointF?=null;private var powerEnd:PointF?=null
- private var mode="";private var first:PointF?=null
- private var busy=false;@Volatile private var lastFrame=0L;private var stable=0;@Volatile private var frozen=false
- @Volatile private var sampleAfter=Long.MAX_VALUE
- private var panelParams:WindowManager.LayoutParams?=null
- @Volatile private var panelRect=RectF()
- private var statusHoldUntil=0L
- private var manualCue=false;private var manualTarget=false
- // Auto mode only acts on the currently selected target, once per selection.
- private var autoAimEnabled=false
- private var autoShootEnabled=false
- private var autoAttempted=false
- private var cueMissCount=0
- private val sampleLoop=object:Runnable {
-  override fun run(){
-   if(cancelled)return
-   if(!busy && mode.isEmpty()){
-    drawing.visibility=View.INVISIBLE
-    sampleAfter=SystemClock.elapsedRealtimeNanos()+100_000_000L
-    main.postDelayed({if(!cancelled && !busy)drawing.visibility=View.VISIBLE},250)
-   }
-   main.postDelayed(this,550)
-  }
- }
- private var enabled=false; private var cancelled=false
- private var plan:Plan?=null
- override fun onBind(i:Intent?)=null
- private fun say(s:String,hold:Boolean=false){
-  status.text=s
-  if(hold)statusHoldUntil=SystemClock.elapsedRealtime()+3500L
- }
- override fun onStartCommand(intent:Intent?,flags:Int,startId:Int):Int{
-  if(intent?.action=="STOP"){stopSelf();return START_NOT_STICKY}
-  if(projection!=null)return START_NOT_STICKY
-  val nm=getSystemService(NOTIFICATION_SERVICE) as NotificationManager
-  nm.createNotificationChannel(NotificationChannel("capture","Screen capture",NotificationManager.IMPORTANCE_LOW))
-  val stop=PendingIntent.getService(this,1,Intent(this,LiveService::class.java).setAction("STOP"),PendingIntent.FLAG_IMMUTABLE)
-  val n=Notification.Builder(this,"capture").setContentTitle("Pool Vision: screen capture active").setContentText("Tap Stop to end capture and gestures").setSmallIcon(android.R.drawable.ic_menu_view).addAction(android.R.drawable.ic_delete,"Stop",stop).build()
-  if(Build.VERSION.SDK_INT>=29)startForeground(10,n,ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION) else startForeground(10,n)
-  try{
-   if(!OpenCVLoader.initLocal())error("OpenCV load failed")
-   wm=getSystemService(WINDOW_SERVICE) as WindowManager
-   val metrics=android.util.DisplayMetrics();@Suppress("DEPRECATION") wm.defaultDisplay.getRealMetrics(metrics)
-   screenW=metrics.widthPixels;screenH=metrics.heightPixels
-   if(screenW<screenH)error("Rotate to landscape before starting capture")
-   table=RectF(screenW*.195f,screenH*.24f,screenW*.805f,screenH*.90f)
-   buildOverlay()
-   @Suppress("DEPRECATION") val consent=intent?.getParcelableExtra<Intent>("consent") ?: error("Missing capture permission")
-   projection=(getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager).getMediaProjection(intent.getIntExtra("code",0),consent)
-   worker.start()
-   projection!!.registerCallback(object:MediaProjection.Callback(){
-    override fun onStop(){stopSelf()}
-    override fun onCapturedContentResize(w:Int,h:Int){if(w!=screenW || h!=screenH){Toast.makeText(this@LiveService,"Capture size changed. Restart using entire-screen capture in landscape.",Toast.LENGTH_LONG).show();stopSelf()}}
-   },main)
-   // Full-size capture; detection runs on a 1280px-wide image.
-   reader=ImageReader.newInstance(screenW,screenH,PixelFormat.RGBA_8888,2)
-   display=projection!!.createVirtualDisplay("PoolVision",screenW,screenH,metrics.densityDpi,DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,reader!!.surface,null,null)
-   reader!!.setOnImageAvailableListener({r->
-    val img=runCatching{r.acquireLatestImage()}.getOrNull() ?: return@setOnImageAvailableListener
-    try{
-     val now=SystemClock.elapsedRealtime()
-     if(frozen || img.timestamp<sampleAfter)return@setOnImageAvailableListener
-     sampleAfter=Long.MAX_VALUE
-     val plane=img.planes[0]
-     // Read rows independently: some devices omit padding after the final row.
-     val pixels=IntArray(img.width*img.height);val buffer=plane.buffer
-     for(y in 0 until img.height)for(x in 0 until img.width){
-      val off=y*plane.rowStride+x*plane.pixelStride
-      pixels[y*img.width+x]=Color.argb(buffer.get(off+3).toInt() and 255,buffer.get(off).toInt() and 255,buffer.get(off+1).toInt() and 255,buffer.get(off+2).toInt() and 255)
-     }
-     val raw=Bitmap.createBitmap(pixels,img.width,img.height,Bitmap.Config.ARGB_8888)
-     val scale=min(1f,1280f/img.width)
-     val bitmap=Bitmap.createScaledBitmap(raw,(img.width*scale).toInt(),(img.height*scale).toInt(),true)
-     val sx=bitmap.width.toFloat()/screenW;val sy=bitmap.height.toFloat()/screenH
-     val bounds=table
-     val area=RectF(bounds.left*sx,bounds.top*sy,bounds.right*sx,bounds.bottom*sy)
-     val result=try{
-      // Exclude the floating menu: white buttons looked like balls in captured frames.
-      val excluded=panelRect
-      val detected=Vision.detect(bitmap,area).filterNot { ball ->
-       excluded.contains(
-        ScreenCoordinates.screen(ball.x,bitmap.width,screenW),
-        ScreenCoordinates.screen(ball.y,bitmap.height,screenH)
-       )
-      }
-      val white=Vision.findCueBallAndDirection(bitmap,detected)
-      val mapped=detected.map{Ball(ScreenCoordinates.screen(it.x,bitmap.width,screenW),ScreenCoordinates.screen(it.y,bitmap.height,screenH),it.r/sx)}
-      val whiteMapped=white.first?.let{Ball(ScreenCoordinates.screen(it.x,bitmap.width,screenW), ScreenCoordinates.screen(it.y,bitmap.height,screenH),it.r/sx)}
-      Triple(mapped,whiteMapped,white.second)
-     }finally{if(bitmap!==raw)bitmap.recycle();raw.recycle()}
-     main.post{if(!cancelled && !busy && mode.isEmpty()){lastFrame=now;update(result.first,result.second,result.third);drawing.visibility=View.VISIBLE}}
-    }catch(e:Exception){main.post{if(!cancelled)say("Detection error: ${e.javaClass.simpleName}")}}finally{img.close()}
-   },Handler(worker.looper))
-   main.post(sampleLoop)
-  }catch(e:Exception){Toast.makeText(this,"Capture failed: ${e.message}",Toast.LENGTH_LONG).show();stopSelf()}
-  return START_NOT_STICKY
- }
- private fun update(found:List<Ball>, whiteCue:Ball?, stickDirection:PointF?){
-  fun track(old:Ball?):Ball? {
-   if(old==null)return null
-   return found.minByOrNull{Vision.distance(it,old)}
-    ?.takeIf{Vision.distance(it,old)<max(old.r,it.r)*2.1f}
-  }
-  val quiet=balls.size==found.size && found.isNotEmpty() &&
-   found.all{b->balls.any{Vision.distance(it,b)<max(b.r,it.r)*.34f}}
-  stable=if(quiet)stable+1 else 0
-  if(!manualCue) {
-   currentCueDirection=stickDirection
-   if(whiteCue!=null){cue=whiteCue;cueMissCount=0}
-   else {
-    cueMissCount++
-    cue=if(cueMissCount<=2)track(cue) else null
-   }
-  }
-  val trackedTarget=track(target)
-  if(trackedTarget!=null){target=trackedTarget;manualTarget=false}
-  else if(!manualTarget)target=null
-  balls=found
-  val selectedCue=cue
-  val selectedTarget=target
-  plan=if(selectedCue!=null && selectedTarget!=null)
-   Vision.bestPocketPlan(selectedCue,selectedTarget,balls,table) else null
-  blockedPreview=if(plan==null && selectedCue!=null && selectedTarget!=null)
-   Vision.blockedRoutePreview(selectedCue,selectedTarget,table) else null
-  if(mode.isEmpty() && !busy && SystemClock.elapsedRealtime()>=statusHoldUntil) {
-   say(when {
-    selectedTarget==null -> "${balls.size} balls • Tap Target once"
-    selectedCue==null -> "White cue undetected • tap Cue once as fallback"
-    plan==null -> "No CLEAR pocket • red path = blocked/approximate"
-    autoAimEnabled && GestureService.instance==null -> "Enable Pool Vision Gestures in Accessibility settings"
-    autoAimEnabled && !GestureService.inGame -> "Game foreground not confirmed by Accessibility service"
-    autoAimEnabled && stable<2 -> "Shot path ready • checking frame stability ${stable}/2"
-    else -> "AUTO POCKET READY • ${balls.size} detected balls"
-   })
-  }
-  drawing.invalidate()
-  // One automatic aim attempt per target. No continuous gestures or repeated shots.
-  if(autoAimEnabled && !autoAttempted && !busy && mode.isEmpty() &&
-     plan!=null && stable>=2 &&
-     GestureService.inGame && SystemClock.elapsedRealtime()-lastFrame<1500L){
-   autoAttempted=true
-   main.postDelayed({
-    if(!cancelled && autoAimEnabled && !busy && mode.isEmpty())execute(autoShootEnabled)
-   },120)
-  }
- }
- private fun fullParams(touch:Boolean)=WindowManager.LayoutParams(-1,-1,WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
-  WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or (if(touch)0 else WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE),PixelFormat.TRANSLUCENT).apply{gravity=Gravity.TOP or Gravity.START;alpha=.65f
-   if(Build.VERSION.SDK_INT>=28)layoutInDisplayCutoutMode=WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
-   if(Build.VERSION.SDK_INT>=30)setFitInsetsTypes(0)
-  }
- private fun pick(s:String){
-  if(busy)return
-  mode=s
-  first=null
-  if(s=="target" || s=="cue" || s=="table") autoAttempted=false
-  sampleAfter=Long.MAX_VALUE
-  drawing.visibility=View.VISIBLE
-  wm.updateViewLayout(drawing,fullParams(true))
-  say("Tap $s${if(s=="table" || s=="power")": first point, then second point" else ""}")
- }
- private fun finishPick(){mode="";wm.updateViewLayout(drawing,fullParams(false));stable=0;plan=null;blockedPreview=null;drawing.invalidate()}
- private fun buildOverlay(){
-  drawing=Guide();wm.addView(drawing,fullParams(false))
-  fun dp(v:Int)=(v*resources.displayMetrics.density).toInt()
-  val box=LinearLayout(this).apply{orientation=1;setPadding(dp(4),dp(2),dp(4),dp(2));setBackgroundColor(Color.rgb(12,22,38))}
-  val header=TextView(this).apply{text="POOL VISION 0.7 • drag here";textSize=12f;setTextColor(Color.CYAN);setPadding(8,8,8,8)}
-  box.addView(header)
-  val body=LinearLayout(this).apply{orientation=1};box.addView(body)
-  status=TextView(this).apply{setTextColor(Color.WHITE);textSize=10f;text="Table → Cue → Target → Pocket"};body.addView(status)
-  fun row():LinearLayout {val r=LinearLayout(this);body.addView(r);return r}
-  fun button(r:LinearLayout,t:String,fn:()->Unit){r.addView(Button(this).apply{text=t;textSize=10f;minWidth=0;minimumWidth=0;setPadding(0,0,0,0);setOnClickListener{fn()}},LinearLayout.LayoutParams(0,dp(36),1f))}
-  val r=row();button(r,"Table"){pick("table")};button(r,"Cue"){pick("cue")};button(r,"Target"){pick("target")}
-  val r2=row();button(r2,"Pocket"){pick("pocket")};button(r2,"Power"){pick("power")};button(r2,"Cancel"){finishPick();say("Selection cancelled")}
-  body.addView(Switch(this).apply{
-   text="AUTO AIM • selected target"
-   textSize=11f;setTextColor(Color.WHITE)
-   setOnCheckedChangeListener{_,v->
-    enabled=v;autoAimEnabled=v;autoAttempted=false
-    say(if(v)"AUTO AIM ON • tap Target once, pocket is automatic" else "Auto Aim OFF")
-   }
-  })
-  body.addView(Switch(this).apply{
-   text="AUTO SHOT • optional (Power calibration required)"
-   textSize=10f;setTextColor(Color.WHITE)
-   setOnCheckedChangeListener{_,v->
-    autoShootEnabled=v
-    if(v && (powerStart==null || powerEnd==null))
-     say("Auto Shot armed but Power is not calibrated. Use Power once.")
-   }
-  })
-  val r3=row()
-  button(r3,"Aim Now"){execute(false)}
-  button(r3,"Aim + Shot"){execute(true)}
-  val footer=LinearLayout(this);box.addView(footer)
-  button(footer,"Hide / Show"){body.visibility=if(body.visibility==View.VISIBLE)View.GONE else View.VISIBLE}
-  button(footer,"STOP"){cancelled=true;stopSelf()}
-  panel=box
-  val params=WindowManager.LayoutParams(min(dp(285),screenW/2),-2,WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,PixelFormat.TRANSLUCENT).apply{gravity=Gravity.TOP or Gravity.START;x=0;y=0}
-  panelParams=params
-  fun updatePanelRect(){
-   if(box.width<=0 || box.height<=0)return
-   val location=IntArray(2)
-   box.getLocationOnScreen(location)
-   panelRect=RectF(
-    location[0].toFloat(), location[1].toFloat(),
-    (location[0]+box.width).toFloat(),(location[1]+box.height).toFloat()
-   )
-  }
-  box.addOnLayoutChangeListener{_,_,_,_,_,_,_,_,_->updatePanelRect()}
-  var startX=0f;var startY=0f;var px=0;var py=0
-  header.setOnTouchListener{_,e->when(e.actionMasked){
-   MotionEvent.ACTION_DOWN->{startX=e.rawX;startY=e.rawY;px=params.x;py=params.y}
-   MotionEvent.ACTION_MOVE->{params.x=(px+e.rawX-startX).toInt().coerceIn(0,max(0,screenW-box.width));params.y=(py+e.rawY-startY).toInt().coerceIn(0,max(0,screenH-box.height));wm.updateViewLayout(box,params);box.post{updatePanelRect()}}
-  };true}
-  wm.addView(box,params)
- }
- private fun execute(shoot:Boolean){
-  val p=plan;val svc=GestureService.instance;val a=powerStart;val b=powerEnd
-  if(busy){say("Aim currently busy",true);return}
-  val reason=when {
-   !enabled -> "AUTO AIM switch is OFF"
-   mode.isNotEmpty() -> "Finish current selection first"
-   target==null -> "Target not selected • tap Target"
-   cue==null -> "White cue ball missing • tap Cue once"
-   p==null -> "No clear direct pocket for this target • try another ball"
-   svc==null -> "Enable Pool Vision Gestures in Accessibility"
-   !GestureService.inGame -> "Accessibility cannot confirm the 8 Ball Pool foreground"
-   SystemClock.elapsedRealtime()-lastFrame>2500 -> "Screen capture frames stale • restart Capture"
-   shoot && (stable<2 || manualCue || manualTarget) -> "Auto Shot requires stable automatically detected balls"
-   shoot && (a==null || b==null) -> "Auto Shot needs one-time Power calibration"
-   else -> null
-  }
-  if(reason!=null){say(reason,true);autoAttempted=false;return}
-  val shotPlan=p ?: return
-  val gestureSvc=svc ?: return
-  val panelLocation=IntArray(2);panel?.getLocationOnScreen(panelLocation)
-  val covered=panel?.let{RectF(panelLocation[0].toFloat(),panelLocation[1].toFloat(),(panelLocation[0]+it.width).toFloat(),(panelLocation[1]+it.height).toFloat())}
-  if(covered!=null && (covered.contains(shotPlan.ghost.x,shotPlan.ghost.y) || (shoot && a!=null && b!=null && RectF.intersects(covered,RectF(min(a.x,b.x)-2,min(a.y,b.y)-2,max(a.x,b.x)+2,max(a.y,b.y)+2))))){say("Move panel away from aim / power slider",true);autoAttempted=false;return}
-  busy=true;frozen=true;say("Aiming — STOP cancels pending shot")
-  // Hide drawings so they cannot obstruct the injected tap or contaminate screenshots.
-  drawing.visibility=View.GONE
-  // The game responds to an on-table tap along cue -> ghost direction, not overlay coordinates.
-  val dx=shotPlan.ghost.x-shotPlan.cue.x
-  val dy=shotPlan.ghost.y-shotPlan.cue.y
-  val length=hypot(dx,dy).coerceAtLeast(1f)
-  val ux=dx/length
-  val uy=dy/length
-  var aimDist=max(length*1.4f,table.width()*.3f)
-  if(ux>0.001f)aimDist=min(aimDist,(table.right-shotPlan.cue.r*2-shotPlan.cue.x)/ux)
-  if(ux<-.001f)aimDist=min(aimDist,(table.left+shotPlan.cue.r*2-shotPlan.cue.x)/ux)
-  if(uy>0.001f)aimDist=min(aimDist,(table.bottom-shotPlan.cue.r*2-shotPlan.cue.y)/uy)
-  if(uy<-.001f)aimDist=min(aimDist,(table.top+shotPlan.cue.r*2-shotPlan.cue.y)/uy)
-  val aim=Path().apply{moveTo(shotPlan.cue.x+ux*max(0f,aimDist),shotPlan.cue.y+uy*max(0f,aimDist))}
-  gestureSvc.gesture(aim,100){ok->
-   if(!ok){reset("Android aim gesture failed");return@gesture}
-   if(!shoot){reset("Auto aim tap sent; verify cue direction before manual shot",false);return@gesture}
-   main.postDelayed({
-    if(cancelled || !GestureService.inGame || !enabled){reset("Shot cancelled",false);return@postDelayed}
-    val path=Path().apply{moveTo(a!!.x,a.y);lineTo(b!!.x,b.y)}
-    gestureSvc.gesture(path,650){shot->reset(if(shot)"Shot gesture sent; check game result" else "Shot gesture failed",shot)}
-   },900)
-  }
- }
- private fun reset(message:String,clearSelection:Boolean=false){
-  if(cancelled)return
-  busy=false;frozen=false;stable=0
-  if(clearSelection){cue=null;target=null;plan=null;blockedPreview=null;autoAttempted=false;manualCue=false;manualTarget=false}
-  drawing.visibility=View.VISIBLE
-  say(message,true)
- }
- inner class Guide:View(this){
-  private val paint=Paint(Paint.ANTI_ALIAS_FLAG)
-  override fun onDraw(c:Canvas){
-   val origin=IntArray(2);getLocationOnScreen(origin)
-   c.save();c.translate(ScreenCoordinates.local(0f,origin[0]),ScreenCoordinates.local(0f,origin[1]))
-   paint.style=Paint.Style.STROKE;paint.strokeWidth=2f;paint.color=Color.CYAN
-   c.drawRect(table,paint)
-   // Outside edges reduce interference with the next detection frame.
-   balls.forEach{paint.color=if(it===cue)Color.WHITE else if(it===target)Color.YELLOW else Color.CYAN;c.drawCircle(it.x,it.y,it.r+5,paint)}
-   // Draw a shot only when the planner finds a direct, unobstructed pot path.
-   // Arrows, ghost-ball point and selected pocket are distinct from demo lines.
-   fun arrow(x1:Float,y1:Float,x2:Float,y2:Float,color:Int){
-    val dx=x2-x1
-    val dy=y2-y1
-    val distance=hypot(dx,dy)
-    if(distance<1f)return
-    val ux=dx/distance
-    val uy=dy/distance
-    val tipX=x2-ux*9f
-    val tipY=y2-uy*9f
-    val size=12f
-    val ax=tipX-ux*size-uy*size*.5f
-    val ay=tipY-uy*size+ux*size*.5f
-    val bx=tipX-ux*size+uy*size*.5f
-    val by=tipY-uy*size-ux*size*.5f
-    paint.color=color
-    paint.strokeWidth=3f
-    c.drawLine(tipX,tipY,ax,ay,paint)
-    c.drawLine(tipX,tipY,bx,by,paint)
-   }
-   val valid=plan
-   val preview=blockedPreview
-   if(valid==null && preview!=null){
-    paint.color=Color.rgb(255,75,65)
-    paint.strokeWidth=3f
-    paint.pathEffect=DashPathEffect(floatArrayOf(14f,10f),0f)
-    c.drawLine(preview.cue.x,preview.cue.y,preview.ghost.x,preview.ghost.y,paint)
-    c.drawLine(preview.target.x,preview.target.y,preview.pocket.x,preview.pocket.y,paint)
-    paint.pathEffect=null
-    paint.textSize=18f
-    paint.style=Paint.Style.FILL
-    c.drawText("BLOCKED - no clear direct pot",table.left+12f,table.bottom-18f,paint)
-    paint.style=Paint.Style.STROKE
-   }else if(valid==null){
-    val selectedCue=cue
-    val selectedTarget=target
-    if(selectedCue!=null && selectedTarget!=null){
-     paint.color=Color.rgb(255,160,50)
-     paint.strokeWidth=2f
-     paint.pathEffect=DashPathEffect(floatArrayOf(12f,9f),0f)
-     c.drawLine(selectedCue.x,selectedCue.y,selectedTarget.x,selectedTarget.y,paint)
-     paint.pathEffect=null
+/**
+ * Read-only pool shot overlay. No accessibility gestures, automatic shooting,
+ * target taps, or pocket selection. Live prediction depends on cue-stick detection.
+ */
+class LiveService: Service() {
+    private val main=Handler(Looper.getMainLooper())
+    private val worker=HandlerThread("pool-vision-worker")
+    private var projection:MediaProjection?=null
+    private var reader:ImageReader?=null
+    private var virtualDisplay:VirtualDisplay?=null
+    private lateinit var windows:WindowManager
+    private lateinit var drawing:Guide
+    private lateinit var status:TextView
+    private var menu:LinearLayout?=null
+    private var screenW=0
+    private var screenH=0
+    private var cloth=RectF()
+    private var allBalls=listOf<Ball>()
+    private var cue:Ball?=null
+    private var direction:V2?=null
+    private var live:LiveTrajectory?=null
+    private var thickness=8f
+    private var showDetection=false
+    private var autoLive=true
+    private var lastFrame=0L
+    private var missed=0
+    @Volatile private var stopped=false
+    @Volatile private var pending=false
+    @Volatile private var processing=false
+    @Volatile private var requestedAt=0L
+    @Volatile private var captureAfterNs=Long.MAX_VALUE
+    @Volatile private var menuBounds=RectF()
+
+    override fun onBind(intent:Intent?):IBinder?=null
+
+    override fun onStartCommand(intent:Intent?,flags:Int,startId:Int):Int {
+        if(intent?.action=="STOP"){stopSelf();return START_NOT_STICKY}
+        if(projection!=null)return START_NOT_STICKY
+        val manager=getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+        manager.createNotificationChannel(NotificationChannel(
+            "pool-vision","Pool Vision capture",NotificationManager.IMPORTANCE_LOW))
+        val stopIntent=PendingIntent.getService(
+            this,1,Intent(this,LiveService::class.java).setAction("STOP"),
+            PendingIntent.FLAG_IMMUTABLE)
+        val note=Notification.Builder(this,"pool-vision")
+            .setContentTitle("Pool Vision • Auto Live")
+            .setContentText("Read-only shot path; tap Stop to end capture")
+            .setSmallIcon(android.R.drawable.ic_menu_view)
+            .addAction(android.R.drawable.ic_delete,"Stop",stopIntent).build()
+        if(Build.VERSION.SDK_INT>=29)
+            startForeground(10,note,ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+        else startForeground(10,note)
+
+        try {
+            if(!OpenCVLoader.initLocal())error("OpenCV failed to initialize")
+            windows=getSystemService(WINDOW_SERVICE) as WindowManager
+            val metrics=android.util.DisplayMetrics()
+            @Suppress("DEPRECATION") windows.defaultDisplay.getRealMetrics(metrics)
+            screenW=metrics.widthPixels
+            screenH=metrics.heightPixels
+            if(screenW<=screenH)error("Start in landscape after opening the game")
+            // Relative cloth frame matching the landscape game screenshot;
+            // scales with screen resolution (no per-shot table selection).
+            cloth=RectF(screenW*.195f,screenH*.24f,screenW*.805f,screenH*.9f)
+            buildOverlay()
+            @Suppress("DEPRECATION")
+            val consent=intent?.getParcelableExtra<Intent>("consent")
+                ?: error("Screen capture consent missing")
+            val projectionManager=getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
+            projection=projectionManager.getMediaProjection(intent.getIntExtra("code",0),consent)
+            worker.start()
+            projection!!.registerCallback(object:MediaProjection.Callback(){
+                override fun onStop(){stopSelf()}
+                override fun onCapturedContentResize(w:Int,h:Int) {
+                    if(w!=screenW || h!=screenH){
+                        Toast.makeText(this@LiveService,"Screen size changed; restart capture in landscape",Toast.LENGTH_LONG).show()
+                        stopSelf()
+                    }
+                }
+            },main)
+            reader=ImageReader.newInstance(screenW,screenH,PixelFormat.RGBA_8888,2)
+            virtualDisplay=projection!!.createVirtualDisplay(
+                "PoolVisionAuto",screenW,screenH,metrics.densityDpi,
+                DisplayManager.VIRTUAL_DISPLAY_FLAG_AUTO_MIRROR,
+                reader!!.surface,null,null)
+            reader!!.setOnImageAvailableListener({ imageReader->
+                val image=runCatching{imageReader.acquireLatestImage()}.getOrNull()
+                    ?: return@setOnImageAvailableListener
+                try {
+                    if(stopped || !pending || !autoLive || image.timestamp<captureAfterNs)
+                        return@setOnImageAvailableListener
+                    pending=false
+                    processing=true
+                    val frameTime=SystemClock.elapsedRealtime()
+                    val plane=image.planes[0]
+                    val buffer=plane.buffer
+                    val pixels=IntArray(image.width*image.height)
+                    for(y in 0 until image.height){
+                        for(x in 0 until image.width){
+                            val index=y*plane.rowStride+x*plane.pixelStride
+                            if(index+3>=buffer.limit())continue
+                            pixels[y*image.width+x]=Color.argb(
+                                buffer.get(index+3).toInt() and 255,
+                                buffer.get(index).toInt() and 255,
+                                buffer.get(index+1).toInt() and 255,
+                                buffer.get(index+2).toInt() and 255)
+                        }
+                    }
+                    val raw=Bitmap.createBitmap(pixels,image.width,image.height,Bitmap.Config.ARGB_8888)
+                    val scale=min(1f,1152f/image.width)
+                    val scaled=Bitmap.createScaledBitmap(raw,
+                        max(1,(image.width*scale).toInt()),
+                        max(1,(image.height*scale).toInt()),true)
+                    val results=try {
+                        val bounds=RectF(
+                            cloth.left*scaled.width/screenW,
+                            cloth.top*scaled.height/screenH,
+                            cloth.right*scaled.width/screenW,
+                            cloth.bottom*scaled.height/screenH)
+                        val obscured=menuBounds
+                        val candidates=Vision.detect(scaled,bounds).filterNot{ b ->
+                            obscured.contains(
+                                b.x*screenW/scaled.width,b.y*screenH/scaled.height)
+                        }
+                        val detection=Vision.findCueBallAndDirection(scaled,candidates)
+                        val balls=candidates.map { b ->
+                            Ball(b.x*screenW/scaled.width,b.y*screenH/scaled.height,
+                                b.r*screenW/scaled.width)
+                        }
+                        val white=detection.first?.let{ b ->
+                            Ball(b.x*screenW/scaled.width,b.y*screenH/scaled.height,
+                                b.r*screenW/scaled.width)
+                        }
+                        Triple(balls,white,detection.second)
+                    } finally {
+                        if(scaled!==raw)scaled.recycle()
+                        raw.recycle()
+                    }
+                    main.post {
+                        try {
+                            if(!stopped) {
+                                lastFrame=frameTime
+                                update(results.first,results.second,results.third)
+                                drawing.visibility=View.VISIBLE
+                            }
+                        } finally {processing=false}
+                    }
+                }catch(e:Exception){
+                    main.post {
+                        if(!stopped){
+                            live=null
+                            status.text="Capture/vision error: ${e.javaClass.simpleName}"
+                            drawing.visibility=View.VISIBLE
+                            drawing.invalidate()
+                        }
+                        processing=false
+                    }
+                }finally{image.close()}
+            },Handler(worker.looper))
+            main.post(sampleLoop)
+        }catch(e:Exception){
+            Toast.makeText(this,"Pool Vision: ${e.message}",Toast.LENGTH_LONG).show()
+            stopSelf()
+        }
+        return START_NOT_STICKY
     }
-   }
-   valid?.let{p->
-    val cueToGhostX=p.ghost.x-p.cue.x
-    val cueToGhostY=p.ghost.y-p.cue.y
-    val len=hypot(cueToGhostX,cueToGhostY).coerceAtLeast(1f)
-    val ux=cueToGhostX/len
-    val uy=cueToGhostY/len
-    paint.strokeWidth=6f
-    paint.color=Color.BLACK
-    c.drawLine(p.cue.x,p.cue.y,p.ghost.x,p.ghost.y,paint)
-    paint.color=Color.YELLOW
-    paint.strokeWidth=3.5f
-    c.drawLine(p.cue.x,p.cue.y,p.ghost.x,p.ghost.y,paint)
-    paint.strokeWidth=3f
-    c.drawCircle(p.ghost.x,p.ghost.y,p.cue.r,paint)
-    arrow(p.cue.x,p.cue.y,p.ghost.x,p.ghost.y,Color.YELLOW)
-    paint.strokeWidth=6f
-    paint.color=Color.BLACK
-    c.drawLine(p.target.x,p.target.y,p.pocket.x,p.pocket.y,paint)
-    paint.color=Color.GREEN
-    paint.strokeWidth=3.5f
-    c.drawLine(p.target.x,p.target.y,p.pocket.x,p.pocket.y,paint)
-    arrow(p.target.x,p.target.y,p.pocket.x,p.pocket.y,Color.GREEN)
-    paint.color=Color.GREEN
-    paint.strokeWidth=3f
-    c.drawCircle(p.pocket.x,p.pocket.y,15f,paint)
-    // An optional cyan ray follows the physical cue's visual direction.
-    currentCueDirection?.let{d->
-     paint.color=Color.CYAN
-     paint.strokeWidth=2.5f
-     val dist=min(table.width()*.27f,220f)
-     c.drawLine(p.cue.x,p.cue.y,p.cue.x+d.x*dist,p.cue.y+d.y*dist,paint)
-     val alignment=acos((ux*d.x+uy*d.y).coerceIn(-1f,1f))*180f/Math.PI.toFloat()
-     paint.style=Paint.Style.FILL
-     paint.textSize=17f
-     paint.color=if(alignment<3f)Color.GREEN else Color.WHITE
-     c.drawText("Cue offset: ${alignment.toInt()} deg",table.left+12f,table.bottom-15f,paint)
-     paint.style=Paint.Style.STROKE
+
+    private val sampleLoop=object:Runnable {
+        override fun run(){
+            if(stopped)return
+            if(!autoLive){
+                live=null
+                drawing.visibility=View.GONE
+            } else if(!processing && !pending){
+                // Hide only the trajectory layer while sampling so it never
+                // feeds into the next detection frame.
+                pending=true
+                requestedAt=SystemClock.elapsedRealtime()
+                drawing.visibility=View.INVISIBLE
+                captureAfterNs=SystemClock.elapsedRealtimeNanos()+50_000_000L
+            } else if(pending && SystemClock.elapsedRealtime()-requestedAt>1400L) {
+                pending=false
+                live=null
+                status.text="Waiting for a fresh screen frame"
+                drawing.visibility=View.VISIBLE
+            }
+            if(SystemClock.elapsedRealtime()-lastFrame>1800L && lastFrame>0L){
+                live=null
+                if(!pending)drawing.invalidate()
+            }
+            main.postDelayed(this,170L)
+        }
     }
-    if(currentCueDirection==null){
-     paint.style=Paint.Style.FILL
-     paint.color=Color.YELLOW
-     paint.textSize=16f
-     val angle=atan2(uy,ux)*180f/Math.PI.toFloat()
-     c.drawText("Recommended aim: ${angle.toInt()} deg",table.left+12f,table.bottom-15f,paint)
-     paint.style=Paint.Style.STROKE
+
+    private fun update(detected:List<Ball>,white:Ball?,visual:PointF?) {
+        allBalls=detected
+        if(white!=null){
+            cue=white
+            missed=0
+        }else{
+            missed++
+            // Keep only short-lived cue positioning, never freeze the aim line.
+            cue=if(missed<=1)cue?.let{old->
+                detected.minByOrNull{Vision.distance(it,old)}
+                    ?.takeIf{Vision.distance(it,old)<max(it.r,old.r)*1.4f}
+            } else null
+        }
+        val previous=direction
+        direction=if(visual==null)null else{
+            val raw=V2(visual.x,visual.y).unit()
+            if(previous!=null && previous.dot(raw)>.95f)
+                (previous*.25f+raw*.75f).unit()
+            else raw
+        }
+        val c=cue
+        val d=direction
+        live=if(autoLive && c!=null && d!=null) {
+            val r=c.r.coerceIn(6f,cloth.width()/45f)
+            val others=detected.filter{Vision.distance(it,c)>max(it.r,c.r)*.85f}
+                .map{Circle2(V2(it.x,it.y),it.r.coerceIn(5f,r*1.4f))}
+            ShotGeometry.trace(
+                Circle2(V2(c.x,c.y),r),
+                d,others,
+                Bounds2(cloth.left,cloth.top,cloth.right,cloth.bottom))
+        } else null
+        status.text=when {
+            !autoLive -> "Auto Live OFF"
+            c==null -> "Scanning white cue ball and stick • ${detected.size} circles"
+            d==null -> "Cue ball seen • searching stick angle"
+            live==null -> "Aim direction unavailable"
+            live!!.hitBall!=null -> "LIVE • first ball collision and outgoing path"
+            else -> "LIVE • cushion path (no ball in aim ray)"
+        }
+        drawing.invalidate()
     }
-   }
-   c.restore()
-  }
-  override fun onTouchEvent(e:MotionEvent):Boolean{
-   if(e.action!=MotionEvent.ACTION_UP)return true
-   val pt=PointF(e.rawX,e.rawY)
-   when(mode){
-    "table"->{
-      if(first==null){first=pt;return true}
-      val f=first!!
-      if(abs(pt.x-f.x)<screenW*.15 || abs(pt.y-f.y)<screenH*.15){
-       say("Table selection too small; retry");first=null;return true
-      }
-      table=RectF(min(f.x,pt.x),min(f.y,pt.y),max(f.x,pt.x),max(f.y,pt.y))
-      cue=null;target=null;manualCue=false;manualTarget=false;autoAttempted=false
+
+    private fun params(touch:Boolean):WindowManager.LayoutParams =
+        WindowManager.LayoutParams(-1,-1,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                (if(touch)0 else WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE),
+            PixelFormat.TRANSLUCENT).apply {
+            gravity=Gravity.TOP or Gravity.START
+            if(Build.VERSION.SDK_INT>=28)
+                layoutInDisplayCutoutMode=
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            if(Build.VERSION.SDK_INT>=30)setFitInsetsTypes(0)
+        }
+
+    private fun buildOverlay(){
+        drawing=Guide()
+        windows.addView(drawing,params(false))
+        fun dp(v:Int)=(v*resources.displayMetrics.density).toInt()
+        val body=LinearLayout(this).apply{
+            orientation=LinearLayout.VERTICAL
+            setPadding(dp(8),dp(6),dp(8),dp(6))
+            setBackgroundColor(Color.rgb(13,22,37))
+        }
+        val title=TextView(this).apply {
+            text="POOL VISION 0.8 • drag"
+            setTextColor(Color.CYAN)
+            textSize=13f
+            setPadding(0,0,0,dp(4))
+        }
+        body.addView(title)
+        status=TextView(this).apply {
+            text="AUTO LIVE • searching for cue stick"
+            textSize=10f
+            setTextColor(Color.WHITE)
+            setPadding(0,0,0,dp(5))
+        }
+        body.addView(status)
+        body.addView(Switch(this).apply {
+            text="AUTO LIVE ESP"
+            textSize=12f
+            setTextColor(Color.WHITE)
+            isChecked=true
+            setOnCheckedChangeListener { _,value ->
+                autoLive=value
+                if(!value){pending=false;live=null;drawing.invalidate()}
+                status.text=if(value)"AUTO LIVE ON • no manual target selection" else "AUTO LIVE OFF"
+            }
+        })
+        val controls=LinearLayout(this)
+        fun addButton(text:String,action:()->Unit){
+            controls.addView(Button(this).apply{
+                this.text=text
+                textSize=10f
+                minimumWidth=0;minWidth=0
+                setPadding(0,0,0,0)
+                setOnClickListener{action()}
+            },LinearLayout.LayoutParams(0,dp(38),1f))
+        }
+        addButton("LINE -"){
+            thickness=(thickness-2f).coerceAtLeast(4f)
+            drawing.invalidate()
+        }
+        addButton("LINE +"){
+            thickness=(thickness+2f).coerceAtMost(16f)
+            drawing.invalidate()
+        }
+        body.addView(controls)
+        body.addView(Switch(this).apply{
+            text="Show ball detector circles (debug)"
+            textSize=10f
+            setTextColor(Color.WHITE)
+            isChecked=false
+            setOnCheckedChangeListener{_,value->
+                showDetection=value
+                drawing.invalidate()
+            }
+        })
+        val footer=LinearLayout(this)
+        body.addView(footer)
+        var collapsed=false
+        lateinit var hideButton:Button
+        hideButton=Button(this).apply{
+            text="HIDE"
+            textSize=10f
+            setOnClickListener{
+                collapsed=!collapsed
+                for(index in 1 until body.childCount-1)
+                    body.getChildAt(index).visibility=
+                        if(collapsed)View.GONE else View.VISIBLE
+                text=if(collapsed)"SHOW" else "HIDE"
+            }
+        }
+        footer.addView(hideButton,LinearLayout.LayoutParams(0,dp(38),1f))
+        footer.addView(Button(this).apply{
+            text="STOP"
+            textSize=10f
+            setOnClickListener{stopSelf()}
+        },LinearLayout.LayoutParams(0,dp(38),1f))
+        menu=body
+        val layout=WindowManager.LayoutParams(
+            min(dp(275),screenW/2),
+            WindowManager.LayoutParams.WRAP_CONTENT,
+            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
+            PixelFormat.TRANSLUCENT).apply{
+                gravity=Gravity.TOP or Gravity.START
+                x=dp(6);y=dp(6)
+                if(Build.VERSION.SDK_INT>=28)
+                    layoutInDisplayCutoutMode=
+                        WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+                if(Build.VERSION.SDK_INT>=30)setFitInsetsTypes(0)
+            }
+        var startX=0f;var startY=0f;var startLeft=0;var startTop=0
+        fun updateMenuBounds() {
+            if(body.width==0 || body.height==0)return
+            val position=IntArray(2)
+            body.getLocationOnScreen(position)
+            menuBounds=RectF(position[0].toFloat(),position[1].toFloat(),
+                (position[0]+body.width).toFloat(),
+                (position[1]+body.height).toFloat())
+        }
+        body.addOnLayoutChangeListener{_,_,_,_,_,_,_,_,_->updateMenuBounds()}
+        title.setOnTouchListener{_,event->
+            when(event.actionMasked){
+                MotionEvent.ACTION_DOWN->{
+                    startX=event.rawX;startY=event.rawY
+                    startLeft=layout.x;startTop=layout.y
+                }
+                MotionEvent.ACTION_MOVE->{
+                    layout.x=(startLeft+(event.rawX-startX).toInt())
+                        .coerceIn(0,max(0,screenW-body.width))
+                    layout.y=(startTop+(event.rawY-startY).toInt())
+                        .coerceIn(0,max(0,screenH-body.height))
+                    windows.updateViewLayout(body,layout)
+                    body.post{updateMenuBounds()}
+                }
+            }
+            true
+        }
+        windows.addView(body,layout)
     }
-    "power"->{if(first==null){first=pt;return true};powerStart=first;powerEnd=pt}
-    "cue","target"->{val selected=balls.minByOrNull{hypot(it.x-pt.x,it.y-pt.y)}?.takeIf{hypot(it.x-pt.x,it.y-pt.y)<it.r*3};if(!table.contains(pt.x,pt.y)){say("Tap inside calibrated table");return true}
-     val detected=balls.minByOrNull{hypot(it.x-pt.x,it.y-pt.y)}
-      ?.takeIf{hypot(it.x-pt.x,it.y-pt.y)<max(it.r,table.width()/67f)*2.2f}
-     val chosen=detected ?: Ball(pt.x,pt.y,(table.width()/67f).coerceIn(7f,24f))
-     if(mode=="cue"){cue=chosen;manualCue=detected==null}
-     else{target=chosen;manualTarget=detected==null}
-     if(cue===target)target=null}
-    "pocket"->pocket=pt
-   }
-   finishPick();return true
-  }
- }
- override fun onDestroy(){
-  cancelled=true;main.removeCallbacksAndMessages(null)
-  runCatching{display?.release()};reader?.setOnImageAvailableListener(null,null)
-  if(worker.isAlive)Handler(worker.looper).post{runCatching{reader?.close()}} else runCatching{reader?.close()}
-  runCatching{projection?.stop()};projection=null
-  worker.quitSafely()
-  if(::drawing.isInitialized)runCatching{wm.removeView(drawing)}
-  panel?.let{runCatching{wm.removeView(it)}}
-  stopForeground(STOP_FOREGROUND_REMOVE);super.onDestroy()
- }
+
+    inner class Guide:View(this) {
+        private val paint=Paint(Paint.ANTI_ALIAS_FLAG)
+        private fun stroke(canvas:Canvas,start:V2,end:V2,color:Int,
+                           width:Float,dashed:Boolean=false) {
+            paint.style=Paint.Style.STROKE
+            paint.strokeCap=Paint.Cap.ROUND
+            paint.strokeJoin=Paint.Join.ROUND
+            paint.pathEffect=if(dashed)
+                DashPathEffect(floatArrayOf(17f,12f),0f) else null
+            paint.strokeWidth=width+6f
+            paint.color=Color.argb(200,0,0,0)
+            canvas.drawLine(start.x,start.y,end.x,end.y,paint)
+            paint.strokeWidth=width
+            paint.color=color
+            canvas.drawLine(start.x,start.y,end.x,end.y,paint)
+            paint.pathEffect=null
+        }
+        override fun onDraw(canvas:Canvas) {
+            super.onDraw(canvas)
+            if(!autoLive)return
+            val position=IntArray(2)
+            getLocationOnScreen(position)
+            canvas.save()
+            canvas.translate(-position[0].toFloat(),-position[1].toFloat())
+            val trace=live
+            if(showDetection) {
+                paint.style=Paint.Style.STROKE
+                paint.strokeWidth=2f
+                paint.color=Color.CYAN
+                canvas.drawRect(cloth,paint)
+                for(b in allBalls) {
+                    paint.color=Color.argb(210,0,255,255)
+                    canvas.drawCircle(b.x,b.y,b.r+4f,paint)
+                }
+                cue?.let{
+                    paint.strokeWidth=4f;paint.color=Color.WHITE
+                    canvas.drawCircle(it.x,it.y,it.r+5f,paint)
+                }
+            }
+            if(trace!=null && SystemClock.elapsedRealtime()-lastFrame<1500L) {
+                val width=thickness
+                // Thick cyan: direction of the currently rotated cue stick.
+                stroke(canvas,trace.cueStart,trace.cueEnd,Color.CYAN,width)
+                val hit=trace.hitBall
+                if(hit!=null) {
+                    paint.style=Paint.Style.STROKE
+                    paint.strokeWidth=4f
+                    paint.color=Color.WHITE
+                    canvas.drawCircle(trace.cueEnd.x,trace.cueEnd.y,
+                        max(8f,cue?.r ?: 10f),paint)
+                    val objEnd=trace.objectEnd
+                    if(objEnd!=null)
+                        stroke(canvas,hit.center,objEnd,Color.GREEN,width)
+                    trace.objectCushionEnd?.let {bounceEnd->
+                        if(objEnd!=null)
+                            stroke(canvas,objEnd,bounceEnd,Color.MAGENTA,width*.8f,true)
+                    }
+                    trace.cueAfterEnd?.let{after->
+                        stroke(canvas,trace.cueEnd,after,
+                            Color.rgb(80,170,255),width*.65f,true)
+                    }
+                }else {
+                    trace.cueCushionEnd?.let {
+                        stroke(canvas,trace.cueEnd,it,Color.MAGENTA,width*.8f,true)
+                    }
+                }
+                paint.style=Paint.Style.FILL
+                paint.color=Color.WHITE
+                paint.textSize=16f
+                canvas.drawText(
+                    if(hit!=null)"Cue → first ball → predicted object path"
+                    else "Cue ray → cushion reflection",
+                    cloth.left+10f,cloth.bottom-14f,paint)
+            }
+            canvas.restore()
+        }
+    }
+
+    override fun onDestroy() {
+        stopped=true
+        main.removeCallbacksAndMessages(null)
+        runCatching {reader?.setOnImageAvailableListener(null,null)}
+        runCatching {virtualDisplay?.release()}
+        runCatching {reader?.close()}
+        runCatching {projection?.stop()}
+        if(worker.isAlive)worker.quitSafely()
+        if(::windows.isInitialized){
+            if(::drawing.isInitialized)runCatching{windows.removeView(drawing)}
+            menu?.let{runCatching{windows.removeView(it)}}
+        }
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        super.onDestroy()
+    }
 }
