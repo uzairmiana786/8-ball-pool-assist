@@ -32,6 +32,8 @@ class LiveService:Service(){
  private var busy=false;@Volatile private var lastFrame=0L;private var stable=0;@Volatile private var frozen=false
  @Volatile private var sampleAfter=Long.MAX_VALUE
  private var panelParams:WindowManager.LayoutParams?=null
+ @Volatile private var panelRect=RectF()
+ private var statusHoldUntil=0L
  private var manualCue=false;private var manualTarget=false
  // Auto mode only acts on the currently selected target, once per selection.
  private var autoAimEnabled=false
@@ -52,7 +54,10 @@ class LiveService:Service(){
  private var enabled=false; private var cancelled=false
  private var plan:Plan?=null
  override fun onBind(i:Intent?)=null
- private fun say(s:String){status.text=s}
+ private fun say(s:String,hold:Boolean=false){
+  status.text=s
+  if(hold)statusHoldUntil=SystemClock.elapsedRealtime()+3500L
+ }
  override fun onStartCommand(intent:Intent?,flags:Int,startId:Int):Int{
   if(intent?.action=="STOP"){stopSelf();return START_NOT_STICKY}
   if(projection!=null)return START_NOT_STICKY
@@ -99,7 +104,14 @@ class LiveService:Service(){
      val bounds=table
      val area=RectF(bounds.left*sx,bounds.top*sy,bounds.right*sx,bounds.bottom*sy)
      val result=try{
-      val detected=Vision.detect(bitmap,area)
+      // Exclude the floating menu: white buttons looked like balls in captured frames.
+      val excluded=panelRect
+      val detected=Vision.detect(bitmap,area).filterNot { ball ->
+       excluded.contains(
+        ScreenCoordinates.screen(ball.x,bitmap.width,screenW),
+        ScreenCoordinates.screen(ball.y,bitmap.height,screenH)
+       )
+      }
       val white=Vision.findCueBall(bitmap,detected)
       val mapped=detected.map{Ball(ScreenCoordinates.screen(it.x,bitmap.width,screenW),ScreenCoordinates.screen(it.y,bitmap.height,screenH),it.r/sx)}
       val whiteMapped=white?.let{Ball(ScreenCoordinates.screen(it.x,bitmap.width,screenW), ScreenCoordinates.screen(it.y,bitmap.height,screenH),it.r/sx)}
@@ -136,18 +148,21 @@ class LiveService:Service(){
   val selectedTarget=target
   plan=if(selectedCue!=null && selectedTarget!=null)
    Vision.bestPocketPlan(selectedCue,selectedTarget,balls,table) else null
-  if(mode.isEmpty() && !busy) {
+  if(mode.isEmpty() && !busy && SystemClock.elapsedRealtime()>=statusHoldUntil) {
    say(when {
-    selectedTarget==null -> "${balls.size} balls • Tap Target once to select a ball"
-    selectedCue==null -> "Target saved • white cue ball not detected; use Cue fallback"
-    plan==null -> "No clear direct pocket path detected • try another target"
-    else -> "AUTO POCKET READY • ${balls.size} balls • ${if(stable>=2)"stable" else "checking"}"
+    selectedTarget==null -> "${balls.size} balls • Tap Target once"
+    selectedCue==null -> "White cue undetected • tap Cue once as fallback"
+    plan==null -> "No clear DIRECT pocket path for selected ball (amber preview only)"
+    autoAimEnabled && GestureService.instance==null -> "Enable Pool Vision Gestures in Accessibility settings"
+    autoAimEnabled && !GestureService.inGame -> "Game foreground not confirmed by Accessibility service"
+    autoAimEnabled && stable<2 -> "Shot path ready • checking frame stability ${stable}/2"
+    else -> "AUTO POCKET READY • ${balls.size} detected balls"
    })
   }
   drawing.invalidate()
   // One automatic aim attempt per target. No continuous gestures or repeated shots.
   if(autoAimEnabled && !autoAttempted && !busy && mode.isEmpty() &&
-     plan!=null && stable>=2 && !manualCue &&
+     plan!=null && stable>=2 &&
      GestureService.inGame && SystemClock.elapsedRealtime()-lastFrame<1500L){
    autoAttempted=true
    main.postDelayed({
@@ -209,25 +224,40 @@ class LiveService:Service(){
   panel=box
   val params=WindowManager.LayoutParams(min(dp(285),screenW/2),-2,WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,PixelFormat.TRANSLUCENT).apply{gravity=Gravity.TOP or Gravity.START;x=0;y=0}
   panelParams=params
+  fun updatePanelRect(){
+   panelRect=RectF(
+    params.x.toFloat(),params.y.toFloat(),
+    (params.x+box.width).toFloat(),(params.y+box.height).toFloat()
+   )
+  }
+  box.addOnLayoutChangeListener{_,_,_,_,_,_,_,_,_->updatePanelRect()}
   var startX=0f;var startY=0f;var px=0;var py=0
   header.setOnTouchListener{_,e->when(e.actionMasked){
    MotionEvent.ACTION_DOWN->{startX=e.rawX;startY=e.rawY;px=params.x;py=params.y}
-   MotionEvent.ACTION_MOVE->{params.x=(px+e.rawX-startX).toInt().coerceIn(0,max(0,screenW-box.width));params.y=(py+e.rawY-startY).toInt().coerceIn(0,max(0,screenH-box.height));wm.updateViewLayout(box,params)}
+   MotionEvent.ACTION_MOVE->{params.x=(px+e.rawX-startX).toInt().coerceIn(0,max(0,screenW-box.width));params.y=(py+e.rawY-startY).toInt().coerceIn(0,max(0,screenH-box.height));wm.updateViewLayout(box,params);updatePanelRect()}
   };true}
   wm.addView(box,params)
  }
  private fun execute(shoot:Boolean){
   val p=plan;val svc=GestureService.instance;val a=powerStart;val b=powerEnd
-  if(busy)return
-  if(!enabled || p==null || svc==null || !GestureService.inGame || mode.isNotEmpty() ||
-    (shoot && (stable<2 || manualCue || manualTarget || a==null || b==null)) ||
-    SystemClock.elapsedRealtime()-lastFrame>2500){
-    say("Aim unavailable: check target, white cue, clear pocket, game foreground or Power")
-    return
+  if(busy){say("Aim currently busy",true);return}
+  val reason=when {
+   !enabled -> "AUTO AIM switch is OFF"
+   mode.isNotEmpty() -> "Finish current selection first"
+   target==null -> "Target not selected • tap Target"
+   cue==null -> "White cue ball missing • tap Cue once"
+   p==null -> "No clear direct pocket for this target • try another ball"
+   svc==null -> "Enable Pool Vision Gestures in Accessibility"
+   !GestureService.inGame -> "Accessibility cannot confirm the 8 Ball Pool foreground"
+   SystemClock.elapsedRealtime()-lastFrame>2500 -> "Screen capture frames stale • restart Capture"
+   shoot && (stable<2 || manualCue || manualTarget) -> "Auto Shot requires stable automatically detected balls"
+   shoot && (a==null || b==null) -> "Auto Shot needs one-time Power calibration"
+   else -> null
   }
+  if(reason!=null){say(reason,true);autoAttempted=false;return}
   val panelLocation=IntArray(2);panel?.getLocationOnScreen(panelLocation)
   val covered=panel?.let{RectF(panelLocation[0].toFloat(),panelLocation[1].toFloat(),(panelLocation[0]+it.width).toFloat(),(panelLocation[1]+it.height).toFloat())}
-  if(covered!=null && (covered.contains(p.ghost.x,p.ghost.y) || (shoot && a!=null && b!=null && RectF.intersects(covered,RectF(min(a.x,b.x)-2,min(a.y,b.y)-2,max(a.x,b.x)+2,max(a.y,b.y)+2))))){say("Move panel away from aim / power slider");return}
+  if(covered!=null && (covered.contains(p.ghost.x,p.ghost.y) || (shoot && a!=null && b!=null && RectF.intersects(covered,RectF(min(a.x,b.x)-2,min(a.y,b.y)-2,max(a.x,b.x)+2,max(a.y,b.y)+2))))){say("Move panel away from aim / power slider",true);autoAttempted=false;return}
   busy=true;frozen=true;say("Aiming — STOP cancels pending shot")
   // Hide drawings so they cannot obstruct the injected tap or contaminate screenshots.
   drawing.visibility=View.GONE
@@ -244,7 +274,7 @@ class LiveService:Service(){
   if(uy<-.001f)aimDist=min(aimDist,(table.top+p.cue.r*2-p.cue.y)/uy)
   val aim=Path().apply{moveTo(p.cue.x+ux*max(0f,aimDist),p.cue.y+uy*max(0f,aimDist))}
   svc.gesture(aim,100){ok->
-   if(!ok){reset("Aim gesture failed");return@gesture}
+   if(!ok){reset("Android aim gesture failed");return@gesture}
    if(!shoot){reset("Auto aim tap sent; verify cue direction before manual shot",false);return@gesture}
    main.postDelayed({
     if(cancelled || !GestureService.inGame || !enabled){reset("Shot cancelled",false);return@postDelayed}
@@ -258,7 +288,7 @@ class LiveService:Service(){
   busy=false;frozen=false;stable=0
   if(clearSelection){cue=null;target=null;plan=null;autoAttempted=false;manualCue=false;manualTarget=false}
   drawing.visibility=View.VISIBLE
-  say(message)
+  say(message,true)
  }
  inner class Guide:View(this){
   private val paint=Paint(Paint.ANTI_ALIAS_FLAG)
@@ -271,11 +301,14 @@ class LiveService:Service(){
    balls.forEach{paint.color=if(it===cue)Color.WHITE else if(it===target)Color.YELLOW else Color.CYAN;c.drawCircle(it.x,it.y,it.r+5,paint)}
    // Diagnostic manual guide remains visible without a detected ball or selected pocket.
    val manualStart=cue;val manualEnd=target
-   if(manualStart!=null && manualEnd!=null){
-    paint.strokeWidth=4f;paint.color=Color.YELLOW
+   if(manualStart!=null && manualEnd!=null && plan==null){
+    // This amber dashed line is NOT a valid pot trajectory.
+    paint.strokeWidth=3f;paint.color=Color.rgb(255,165,0)
+    paint.pathEffect=DashPathEffect(floatArrayOf(13f,9f),0f)
     c.drawLine(manualStart.x,manualStart.y,manualEnd.x,manualEnd.y,paint)
+    paint.pathEffect=null
     c.drawCircle(manualStart.x,manualStart.y,manualStart.r+3f,paint)
-    paint.color=Color.GREEN
+    paint.color=Color.rgb(255,165,0)
     c.drawCircle(manualEnd.x,manualEnd.y,manualEnd.r+3f,paint)
     paint.strokeWidth=2f
    }
