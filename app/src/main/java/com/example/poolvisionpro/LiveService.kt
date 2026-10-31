@@ -103,7 +103,7 @@ class LiveService: Service() {
                 val image=runCatching{imageReader.acquireLatestImage()}.getOrNull()
                     ?: return@setOnImageAvailableListener
                 try {
-                    if(stopped || !pending || !autoLive || image.timestamp<captureAfterNs)
+                    if(stopped || !pending || !autoLive)
                         return@setOnImageAvailableListener
                     pending=false
                     processing=true
@@ -193,18 +193,18 @@ class LiveService: Service() {
                 pending=true
                 requestedAt=SystemClock.elapsedRealtime()
                 drawing.visibility=View.INVISIBLE
-                captureAfterNs=SystemClock.elapsedRealtimeNanos()+50_000_000L
-            } else if(pending && SystemClock.elapsedRealtime()-requestedAt>1400L) {
+                captureAfterNs=0L
+            } else if(pending && SystemClock.elapsedRealtime()-requestedAt>4500L) {
                 pending=false
                 live=null
                 status.text="Waiting for a fresh screen frame"
                 drawing.visibility=View.VISIBLE
             }
-            if(SystemClock.elapsedRealtime()-lastFrame>1800L && lastFrame>0L){
+            if(SystemClock.elapsedRealtime()-lastFrame>5000L && lastFrame>0L){
                 live=null
                 if(!pending)drawing.invalidate()
             }
-            main.postDelayed(this,170L)
+            main.postDelayed(this,300L)
         }
     }
 
@@ -431,7 +431,7 @@ class LiveService: Service() {
                     canvas.drawCircle(it.x,it.y,it.r+5f,paint)
                 }
             }
-            if(trace!=null && SystemClock.elapsedRealtime()-lastFrame<1500L) {
+            if(trace!=null && SystemClock.elapsedRealtime()-lastFrame<5000L) {
                 val width=thickness
                 // Thick cyan: direction of the currently rotated cue stick.
                 stroke(canvas,trace.cueStart,trace.cueEnd,Color.CYAN,width)
