@@ -91,7 +91,7 @@ object Vision {
      * Among circular candidates, prefer a bright, low-saturation mostly-white ball.
      * Can confuse striped balls, so auto shoot must remain guarded.
      */
-    fun findCueBallAndDirection(bitmap:Bitmap, found:List<Ball>):Pair<Ball?,PointF?> {
+    fun findCueBallAndDirection(bitmap:Bitmap, found:List<Ball>, playingSurface:RectF):Pair<Ball?,PointF?> {
         if(found.isEmpty()) return Pair(null,null)
 
         // Colored in-game aiming lines should not be treated as a physical cue stick.
@@ -102,6 +102,7 @@ object Vision {
         val edges=Mat()
         val segments=Mat()
         val woodenLines=mutableListOf<FloatArray>()
+        val guideLines=mutableListOf<FloatArray>()
         try {
             Utils.bitmapToMat(bitmap,src)
             Imgproc.cvtColor(src,gray,Imgproc.COLOR_RGBA2GRAY)
@@ -117,6 +118,9 @@ object Vision {
                 val mx=((x1+x2)*.5f).toInt()
                 val my=((y1+y2)*.5f).toInt()
                 if(mx<0 || my<0 || mx>=bitmap.width || my>=bitmap.height)continue
+                // HUD/table rails may have long straight edges: use the cloth ROI.
+                if(!playingSurface.contains(mx.toFloat(),my.toFloat()))continue
+                guideLines.add(floatArrayOf(x1,y1,x2,y2))
                 val pixel=bitmap.getPixel(mx,my)
                 val red=Color.red(pixel);val green=Color.green(pixel);val blue=Color.blue(pixel)
                 if(red>green+18 && green>blue+8 && red>75) {
@@ -183,7 +187,57 @@ object Vision {
                 }
             }
         }
-        // No reliable wooden cue? Do not assume the brightest stripe is the cue.
+        // A wooden cue can merge into the game's bright native aim line.
+        // As a fallback, use one long straight edge crossing a white candidate,
+        // and locate the brown shaft on precisely ONE side of that candidate.
+        // This identifies direction from wood -> white ball -> shot, without
+        // manually selecting a cue, target, pocket, or table each turn.
+        if(selected==null){
+            var bestFallback=Float.NEGATIVE_INFINITY
+            for(ball in found){
+                val whiteScore=whiteness(ball)
+                if(whiteScore<.12f)continue
+                for(line in guideLines){
+                    val x1=line[0];val y1=line[1];val x2=line[2];val y2=line[3]
+                    val vx=x2-x1;val vy=y2-y1
+                    val lineLength=hypot(vx,vy)
+                    if(lineLength<ball.r*7f)continue
+                    val ux=vx/lineLength;val uy=vy/lineLength
+                    val along=(ball.x-x1)*ux+(ball.y-y1)*uy
+                    val cross=abs((ball.x-x1)*uy-(ball.y-y1)*ux)
+                    if(along< -ball.r*3f || along>lineLength+ball.r*3f ||
+                       cross>ball.r*1.15f)continue
+                    fun woodVotes(sign:Float):Int{
+                        var count=0
+                        for(m in floatArrayOf(3f,4f,5f,6f,8f,10f,12f)){
+                            val px=ball.x+sign*ux*ball.r*m
+                            val py=ball.y+sign*uy*ball.r*m
+                            if(!playingSurface.contains(px,py))continue
+                            val xx=px.toInt();val yy=py.toInt()
+                            if(xx<0||yy<0||xx>=bitmap.width||yy>=bitmap.height)continue
+                            val sample=bitmap.getPixel(xx,yy)
+                            val r=Color.red(sample);val g=Color.green(sample)
+                            val b=Color.blue(sample)
+                            if(r>g+8 && g>b+6 && r in 66..239)count++
+                        }
+                        return count
+                    }
+                    val leftVotes=woodVotes(-1f)
+                    val rightVotes=woodVotes(1f)
+                    val dominant=max(leftVotes,rightVotes)
+                    val separation=abs(leftVotes-rightVotes)
+                    if(dominant<3 || separation<3)continue
+                    val score=whiteScore*4f+separation*1.4f -
+                        cross/ball.r*4f
+                    if(score>bestFallback) {
+                        bestFallback=score
+                        selected=ball
+                        val sign=if(rightVotes>leftVotes) -1f else 1f
+                        direction=PointF(ux*sign,uy*sign)
+                    }
+                }
+            }
+        }
         return Pair(selected,direction)
     }
 
