@@ -36,7 +36,7 @@ class LiveService:Service(){
  private val sampleLoop=object:Runnable {
   override fun run(){
    if(cancelled)return
-   if(!busy && mode.isEmpty()){
+   if(!busy && mode.isEmpty() && !(manualCue && manualTarget)){
     drawing.visibility=View.INVISIBLE
     sampleAfter=SystemClock.elapsedRealtimeNanos()+180_000_000L
     main.postDelayed({if(!cancelled && !busy)drawing.visibility=View.VISIBLE},450)
@@ -106,11 +106,11 @@ class LiveService:Service(){
   val quiet=balls.size==found.size && found.isNotEmpty() && found.all{b->balls.any{Vision.distance(it,b)<b.r*.25f}}
   stable=if(quiet)stable+1 else 0
   val newCue=track(cue);val newTarget=track(target)
-  if(newCue!=null){cue=newCue;manualCue=false}else if(!manualCue)cue=null
-  if(newTarget!=null){target=newTarget;manualTarget=false}else if(!manualTarget)target=null
+  if(!manualCue) cue=newCue
+  if(!manualTarget) target=newTarget
   balls=found
   plan=if(cue!=null && target!=null && pocket!=null)Vision.plan(cue!!,target!!,pocket!!,balls,table) else null
-  if(mode.isEmpty() && !busy)say("${balls.size} circles • ${if(stable>=3)"stable" else "moving"} • ${if(plan!=null)"path ready" else "select cue, target, pocket / path blocked"}")
+  if(mode.isEmpty() && !busy)say(if(manualCue && manualTarget) "MANUAL GUIDE ACTIVE (not automated shot prediction)" else "${balls.size} circles • ${if(stable>=3)"stable" else "moving"} • ${if(plan!=null)"path ready" else "select cue, target, pocket / path blocked"}")
   drawing.invalidate()
  }
  private fun fullParams(touch:Boolean)=WindowManager.LayoutParams(-1,-1,WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
@@ -178,6 +178,16 @@ class LiveService:Service(){
    c.drawRect(table,paint)
    // Outside edges reduce interference with the next detection frame.
    balls.forEach{paint.color=if(it===cue)Color.WHITE else if(it===target)Color.YELLOW else Color.CYAN;c.drawCircle(it.x,it.y,it.r+5,paint)}
+   // Diagnostic manual guide remains visible without a detected ball or selected pocket.
+   val manualStart=cue;val manualEnd=target
+   if(manualStart!=null && manualEnd!=null){
+    paint.strokeWidth=4f;paint.color=Color.YELLOW
+    c.drawLine(manualStart.x,manualStart.y,manualEnd.x,manualEnd.y,paint)
+    c.drawCircle(manualStart.x,manualStart.y,manualStart.r+3f,paint)
+    paint.color=Color.GREEN
+    c.drawCircle(manualEnd.x,manualEnd.y,manualEnd.r+3f,paint)
+    paint.strokeWidth=2f
+   }
    plan?.let{p->paint.color=Color.YELLOW;c.drawLine(p.cue.x,p.cue.y,p.ghost.x,p.ghost.y,paint);c.drawCircle(p.ghost.x,p.ghost.y,p.cue.r,paint);paint.color=Color.GREEN;c.drawLine(p.target.x,p.target.y,p.pocket.x,p.pocket.y,paint)}
    c.restore()
   }
@@ -185,11 +195,11 @@ class LiveService:Service(){
    if(e.action!=MotionEvent.ACTION_UP)return true
    val pt=PointF(e.rawX,e.rawY)
    when(mode){
-    "table"->{if(first==null){first=pt;return true};val f=first!!;if(abs(pt.x-f.x)<screenW*.3 || abs(pt.y-f.y)<screenH*.3){say("Table selection too small; retry");first=null;return true};table=RectF(min(f.x,pt.x),min(f.y,pt.y),max(f.x,pt.x),max(f.y,pt.y));cue=null;target=null}
+    "table"->{if(first==null){first=pt;return true};val f=first!!;if(abs(pt.x-f.x)<screenW*.15 || abs(pt.y-f.y)<screenH*.15){say("Table selection too small; retry");first=null;return true};table=RectF(min(f.x,pt.x),min(f.y,pt.y),max(f.x,pt.x),max(f.y,pt.y));cue=null;target=null;manualCue=false;manualTarget=false}
     "power"->{if(first==null){first=pt;return true};powerStart=first;powerEnd=pt}
     "cue","target"->{val selected=balls.minByOrNull{hypot(it.x-pt.x,it.y-pt.y)}?.takeIf{hypot(it.x-pt.x,it.y-pt.y)<it.r*3};if(!table.contains(pt.x,pt.y)){say("Tap inside calibrated table");return true}
-     val chosen=selected ?: Ball(pt.x,pt.y,table.width()/67f)
-     if(mode=="cue"){cue=chosen;manualCue=selected==null}else{target=chosen;manualTarget=selected==null};if(cue===target)target=null}
+     val chosen=Ball(pt.x,pt.y,(table.width()/67f).coerceIn(7f,24f))
+     if(mode=="cue"){cue=chosen;manualCue=true}else{target=chosen;manualTarget=true};if(cue===target)target=null}
     "pocket"->pocket=pt
    }
    finishPick();return true
