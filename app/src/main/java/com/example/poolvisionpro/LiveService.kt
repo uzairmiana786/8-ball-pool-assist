@@ -40,6 +40,7 @@ class LiveService: Service() {
     private var autoLive=true
     private var lastFrame=0L
     private var missed=0
+    private var directionMissed=0
     private var framesProcessed=0L
     private var lastProcessingMs=0L
     @Volatile private var stopped=false
@@ -254,10 +255,14 @@ class LiveService: Service() {
             } else null
         }
         val previous=direction
-        direction=if(visual==null)null else{
+        direction=if(visual==null) {
+            directionMissed++
+            if(directionMissed<=1 && cue!=null)previous else null
+        } else {
+            directionMissed=0
             val raw=V2(visual.x,visual.y).unit()
             if(previous!=null && previous.dot(raw)>.95f)
-                (previous*.25f+raw*.75f).unit()
+                (previous*.2f+raw*.8f).unit()
             else raw
         }
         val c=cue
@@ -274,8 +279,9 @@ class LiveService: Service() {
         status.text=when {
             !autoLive -> "Auto Live OFF"
             c==null -> "SCAN ${detected.size} balls • searching white cue and wooden stick • frame ${framesProcessed}"
-            d==null -> "Cue found • searching current stick angle • ${lastProcessingMs}ms"
+            d==null -> "Cue found • wooden stick angle not reliable • ${lastProcessingMs}ms"
             live==null -> "Aim direction unavailable"
+            directionMissed>0 -> "LIVE (angle reacquiring) • ${lastProcessingMs}ms/frame"
             live!!.hitBall!=null -> "LIVE • ball collision path • ${lastProcessingMs}ms/frame"
             else -> "LIVE • cue ray + cushion • ${lastProcessingMs}ms/frame"
         }
