@@ -16,8 +16,8 @@ class MainActivity:Activity(){
   val scroll=ScrollView(this);scroll.addView(layout);setContentView(scroll)
   fun label(s:String){layout.addView(TextView(this).apply{text=s;textSize=18f;setPadding(0,12,0,12)})}
   fun button(s:String,action:()->Unit){layout.addView(Button(this).apply{text=s;setOnClickListener{action()}})}
-  label("POOL VISION • Experimental 0.5")
-  label("Local screen detection + selected-shot assistance. Device testing required. No guaranteed pots. Start in landscape and share the ENTIRE screen. Stop and restart after rotation.")
+  label("POOL VISION • Auto Aim 0.6")
+  label("Auto cue tracking + tap Target once + AUTO AIM switch. App chooses a clear pocket and shows shot guides. AUTO SHOT is separately armed and requires one-time Power calibration. Experimental accuracy: no guaranteed pots. Start in landscape and share the ENTIRE screen.")
   label("Accessibility sends only the aim tap and calibrated power swipe when you press Aim + Shoot. Screen frames stay in memory; no uploads or recordings. Turn this service off in Android settings whenever you wish.")
   button("1 • Allow floating controls"){startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,Uri.parse("package:$packageName")))}
   button("2 • Enable Pool Vision gestures"){startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))}
