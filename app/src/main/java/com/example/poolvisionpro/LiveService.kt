@@ -27,6 +27,8 @@ class LiveService:Service(){
  private var screenW=0; private var screenH=0
  private var balls=listOf<Ball>();@Volatile private var table=RectF()
  private var cue:Ball?=null;private var target:Ball?=null;private var pocket:PointF?=null
+ private var currentCueDirection:PointF?=null
+ private var blockedPreview:Plan?=null
  private var powerStart:PointF?=null;private var powerEnd:PointF?=null
  private var mode="";private var first:PointF?=null
  private var busy=false;@Volatile private var lastFrame=0L;private var stable=0;@Volatile private var frozen=false
@@ -112,19 +114,19 @@ class LiveService:Service(){
         ScreenCoordinates.screen(ball.y,bitmap.height,screenH)
        )
       }
-      val white=Vision.findCueBall(bitmap,detected)
+      val white=Vision.findCueBallAndDirection(bitmap,detected)
       val mapped=detected.map{Ball(ScreenCoordinates.screen(it.x,bitmap.width,screenW),ScreenCoordinates.screen(it.y,bitmap.height,screenH),it.r/sx)}
-      val whiteMapped=white?.let{Ball(ScreenCoordinates.screen(it.x,bitmap.width,screenW), ScreenCoordinates.screen(it.y,bitmap.height,screenH),it.r/sx)}
-      Pair(mapped,whiteMapped)
+      val whiteMapped=white.first?.let{Ball(ScreenCoordinates.screen(it.x,bitmap.width,screenW), ScreenCoordinates.screen(it.y,bitmap.height,screenH),it.r/sx)}
+      Triple(mapped,whiteMapped,white.second)
      }finally{if(bitmap!==raw)bitmap.recycle();raw.recycle()}
-     main.post{if(!cancelled && !busy && mode.isEmpty()){lastFrame=now;update(result.first,result.second);drawing.visibility=View.VISIBLE}}
+     main.post{if(!cancelled && !busy && mode.isEmpty()){lastFrame=now;update(result.first,result.second,result.third);drawing.visibility=View.VISIBLE}}
     }catch(e:Exception){main.post{if(!cancelled)say("Detection error: ${e.javaClass.simpleName}")}}finally{img.close()}
    },Handler(worker.looper))
    main.post(sampleLoop)
   }catch(e:Exception){Toast.makeText(this,"Capture failed: ${e.message}",Toast.LENGTH_LONG).show();stopSelf()}
   return START_NOT_STICKY
  }
- private fun update(found:List<Ball>, whiteCue:Ball?){
+ private fun update(found:List<Ball>, whiteCue:Ball?, stickDirection:PointF?){
   fun track(old:Ball?):Ball? {
    if(old==null)return null
    return found.minByOrNull{Vision.distance(it,old)}
@@ -134,6 +136,7 @@ class LiveService:Service(){
    found.all{b->balls.any{Vision.distance(it,b)<max(b.r,it.r)*.34f}}
   stable=if(quiet)stable+1 else 0
   if(!manualCue) {
+   currentCueDirection=stickDirection
    if(whiteCue!=null){cue=whiteCue;cueMissCount=0}
    else {
     cueMissCount++
@@ -148,11 +151,13 @@ class LiveService:Service(){
   val selectedTarget=target
   plan=if(selectedCue!=null && selectedTarget!=null)
    Vision.bestPocketPlan(selectedCue,selectedTarget,balls,table) else null
+  blockedPreview=if(plan==null && selectedCue!=null && selectedTarget!=null)
+   Vision.blockedRoutePreview(selectedCue,selectedTarget,table) else null
   if(mode.isEmpty() && !busy && SystemClock.elapsedRealtime()>=statusHoldUntil) {
    say(when {
     selectedTarget==null -> "${balls.size} balls • Tap Target once"
     selectedCue==null -> "White cue undetected • tap Cue once as fallback"
-    plan==null -> "No clear DIRECT pocket path for selected ball (amber preview only)"
+    plan==null -> "No CLEAR pocket • red path = blocked/approximate"
     autoAimEnabled && GestureService.instance==null -> "Enable Pool Vision Gestures in Accessibility settings"
     autoAimEnabled && !GestureService.inGame -> "Game foreground not confirmed by Accessibility service"
     autoAimEnabled && stable<2 -> "Shot path ready • checking frame stability ${stable}/2"
@@ -185,7 +190,7 @@ class LiveService:Service(){
   wm.updateViewLayout(drawing,fullParams(true))
   say("Tap $s${if(s=="table" || s=="power")": first point, then second point" else ""}")
  }
- private fun finishPick(){mode="";wm.updateViewLayout(drawing,fullParams(false));stable=0;plan=null;drawing.invalidate()}
+ private fun finishPick(){mode="";wm.updateViewLayout(drawing,fullParams(false));stable=0;plan=null;blockedPreview=null;drawing.invalidate()}
  private fun buildOverlay(){
   drawing=Guide();wm.addView(drawing,fullParams(false))
   fun dp(v:Int)=(v*resources.displayMetrics.density).toInt()
@@ -291,7 +296,7 @@ class LiveService:Service(){
  private fun reset(message:String,clearSelection:Boolean=false){
   if(cancelled)return
   busy=false;frozen=false;stable=0
-  if(clearSelection){cue=null;target=null;plan=null;autoAttempted=false;manualCue=false;manualTarget=false}
+  if(clearSelection){cue=null;target=null;plan=null;blockedPreview=null;autoAttempted=false;manualCue=false;manualTarget=false}
   drawing.visibility=View.VISIBLE
   say(message,true)
  }
@@ -304,27 +309,97 @@ class LiveService:Service(){
    c.drawRect(table,paint)
    // Outside edges reduce interference with the next detection frame.
    balls.forEach{paint.color=if(it===cue)Color.WHITE else if(it===target)Color.YELLOW else Color.CYAN;c.drawCircle(it.x,it.y,it.r+5,paint)}
-   // Diagnostic manual guide remains visible without a detected ball or selected pocket.
-   val manualStart=cue;val manualEnd=target
-   if(manualStart!=null && manualEnd!=null && plan==null){
-    // This amber dashed line is NOT a valid pot trajectory.
-    paint.strokeWidth=3f;paint.color=Color.rgb(255,165,0)
-    paint.pathEffect=DashPathEffect(floatArrayOf(13f,9f),0f)
-    c.drawLine(manualStart.x,manualStart.y,manualEnd.x,manualEnd.y,paint)
-    paint.pathEffect=null
-    c.drawCircle(manualStart.x,manualStart.y,manualStart.r+3f,paint)
-    paint.color=Color.rgb(255,165,0)
-    c.drawCircle(manualEnd.x,manualEnd.y,manualEnd.r+3f,paint)
-    paint.strokeWidth=2f
+   // Draw a shot only when the planner finds a direct, unobstructed pot path.
+   // Arrows, ghost-ball point and selected pocket are distinct from demo lines.
+   fun arrow(x1:Float,y1:Float,x2:Float,y2:Float,color:Int){
+    val dx=x2-x1
+    val dy=y2-y1
+    val distance=hypot(dx,dy)
+    if(distance<1f)return
+    val ux=dx/distance
+    val uy=dy/distance
+    val tipX=x2-ux*9f
+    val tipY=y2-uy*9f
+    val size=12f
+    val ax=tipX-ux*size-uy*size*.5f
+    val ay=tipY-uy*size+ux*size*.5f
+    val bx=tipX-ux*size+uy*size*.5f
+    val by=tipY-uy*size-ux*size*.5f
+    paint.color=color
+    paint.strokeWidth=3f
+    c.drawLine(tipX,tipY,ax,ay,paint)
+    c.drawLine(tipX,tipY,bx,by,paint)
    }
-   plan?.let{p->
-    paint.strokeWidth=4f
-    paint.color=Color.YELLOW
+   val valid=plan
+   val preview=blockedPreview
+   if(valid==null && preview!=null){
+    paint.color=Color.rgb(255,75,65)
+    paint.strokeWidth=3f
+    paint.pathEffect=DashPathEffect(floatArrayOf(14f,10f),0f)
+    c.drawLine(preview.cue.x,preview.cue.y,preview.ghost.x,preview.ghost.y,paint)
+    c.drawLine(preview.target.x,preview.target.y,preview.pocket.x,preview.pocket.y,paint)
+    paint.pathEffect=null
+    paint.textSize=18f
+    paint.style=Paint.Style.FILL
+    c.drawText("BLOCKED - no clear direct pot",table.left+12f,table.bottom-18f,paint)
+    paint.style=Paint.Style.STROKE
+   }else if(valid==null){
+    val selectedCue=cue
+    val selectedTarget=target
+    if(selectedCue!=null && selectedTarget!=null){
+     paint.color=Color.rgb(255,160,50)
+     paint.strokeWidth=2f
+     paint.pathEffect=DashPathEffect(floatArrayOf(12f,9f),0f)
+     c.drawLine(selectedCue.x,selectedCue.y,selectedTarget.x,selectedTarget.y,paint)
+     paint.pathEffect=null
+    }
+   }
+   valid?.let{p->
+    val cueToGhostX=p.ghost.x-p.cue.x
+    val cueToGhostY=p.ghost.y-p.cue.y
+    val len=hypot(cueToGhostX,cueToGhostY).coerceAtLeast(1f)
+    val ux=cueToGhostX/len
+    val uy=cueToGhostY/len
+    paint.strokeWidth=6f
+    paint.color=Color.BLACK
     c.drawLine(p.cue.x,p.cue.y,p.ghost.x,p.ghost.y,paint)
+    paint.color=Color.YELLOW
+    paint.strokeWidth=3.5f
+    c.drawLine(p.cue.x,p.cue.y,p.ghost.x,p.ghost.y,paint)
+    paint.strokeWidth=3f
     c.drawCircle(p.ghost.x,p.ghost.y,p.cue.r,paint)
-    paint.color=Color.GREEN
+    arrow(p.cue.x,p.cue.y,p.ghost.x,p.ghost.y,Color.YELLOW)
+    paint.strokeWidth=6f
+    paint.color=Color.BLACK
     c.drawLine(p.target.x,p.target.y,p.pocket.x,p.pocket.y,paint)
-    paint.strokeWidth=2f
+    paint.color=Color.GREEN
+    paint.strokeWidth=3.5f
+    c.drawLine(p.target.x,p.target.y,p.pocket.x,p.pocket.y,paint)
+    arrow(p.target.x,p.target.y,p.pocket.x,p.pocket.y,Color.GREEN)
+    paint.color=Color.GREEN
+    paint.strokeWidth=3f
+    c.drawCircle(p.pocket.x,p.pocket.y,15f,paint)
+    // An optional cyan ray follows the physical cue's visual direction.
+    currentCueDirection?.let{d->
+     paint.color=Color.CYAN
+     paint.strokeWidth=2.5f
+     val dist=min(table.width()*.27f,220f)
+     c.drawLine(p.cue.x,p.cue.y,p.cue.x+d.x*dist,p.cue.y+d.y*dist,paint)
+     val alignment=acos((ux*d.x+uy*d.y).coerceIn(-1f,1f))*180f/Math.PI.toFloat()
+     paint.style=Paint.Style.FILL
+     paint.textSize=17f
+     paint.color=if(alignment<3f)Color.GREEN else Color.WHITE
+     c.drawText("Cue offset: ${alignment.toInt()} deg",table.left+12f,table.bottom-15f,paint)
+     paint.style=Paint.Style.STROKE
+    }
+    if(currentCueDirection==null){
+     paint.style=Paint.Style.FILL
+     paint.color=Color.YELLOW
+     paint.textSize=16f
+     val angle=atan2(uy,ux)*180f/Math.PI.toFloat()
+     c.drawText("Recommended aim: ${angle.toInt()} deg",table.left+12f,table.bottom-15f,paint)
+     paint.style=Paint.Style.STROKE
+    }
    }
    c.restore()
   }
