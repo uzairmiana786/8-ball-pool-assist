@@ -258,31 +258,33 @@ class LiveService:Service(){
    else -> null
   }
   if(reason!=null){say(reason,true);autoAttempted=false;return}
+  val shotPlan=p ?: return
+  val gestureSvc=svc ?: return
   val panelLocation=IntArray(2);panel?.getLocationOnScreen(panelLocation)
   val covered=panel?.let{RectF(panelLocation[0].toFloat(),panelLocation[1].toFloat(),(panelLocation[0]+it.width).toFloat(),(panelLocation[1]+it.height).toFloat())}
-  if(covered!=null && (covered.contains(p.ghost.x,p.ghost.y) || (shoot && a!=null && b!=null && RectF.intersects(covered,RectF(min(a.x,b.x)-2,min(a.y,b.y)-2,max(a.x,b.x)+2,max(a.y,b.y)+2))))){say("Move panel away from aim / power slider",true);autoAttempted=false;return}
+  if(covered!=null && (covered.contains(shotPlan.ghost.x,shotPlan.ghost.y) || (shoot && a!=null && b!=null && RectF.intersects(covered,RectF(min(a.x,b.x)-2,min(a.y,b.y)-2,max(a.x,b.x)+2,max(a.y,b.y)+2))))){say("Move panel away from aim / power slider",true);autoAttempted=false;return}
   busy=true;frozen=true;say("Aiming — STOP cancels pending shot")
   // Hide drawings so they cannot obstruct the injected tap or contaminate screenshots.
   drawing.visibility=View.GONE
   // The game responds to an on-table tap along cue -> ghost direction, not overlay coordinates.
-  val dx=p.ghost.x-p.cue.x
-  val dy=p.ghost.y-p.cue.y
+  val dx=shotPlan.ghost.x-shotPlan.cue.x
+  val dy=shotPlan.ghost.y-shotPlan.cue.y
   val length=hypot(dx,dy).coerceAtLeast(1f)
   val ux=dx/length
   val uy=dy/length
   var aimDist=max(length*1.4f,table.width()*.3f)
-  if(ux>0.001f)aimDist=min(aimDist,(table.right-p.cue.r*2-p.cue.x)/ux)
-  if(ux<-.001f)aimDist=min(aimDist,(table.left+p.cue.r*2-p.cue.x)/ux)
-  if(uy>0.001f)aimDist=min(aimDist,(table.bottom-p.cue.r*2-p.cue.y)/uy)
-  if(uy<-.001f)aimDist=min(aimDist,(table.top+p.cue.r*2-p.cue.y)/uy)
-  val aim=Path().apply{moveTo(p.cue.x+ux*max(0f,aimDist),p.cue.y+uy*max(0f,aimDist))}
-  svc.gesture(aim,100){ok->
+  if(ux>0.001f)aimDist=min(aimDist,(table.right-shotPlan.cue.r*2-shotPlan.cue.x)/ux)
+  if(ux<-.001f)aimDist=min(aimDist,(table.left+shotPlan.cue.r*2-shotPlan.cue.x)/ux)
+  if(uy>0.001f)aimDist=min(aimDist,(table.bottom-shotPlan.cue.r*2-shotPlan.cue.y)/uy)
+  if(uy<-.001f)aimDist=min(aimDist,(table.top+shotPlan.cue.r*2-shotPlan.cue.y)/uy)
+  val aim=Path().apply{moveTo(shotPlan.cue.x+ux*max(0f,aimDist),shotPlan.cue.y+uy*max(0f,aimDist))}
+  gestureSvc.gesture(aim,100){ok->
    if(!ok){reset("Android aim gesture failed");return@gesture}
    if(!shoot){reset("Auto aim tap sent; verify cue direction before manual shot",false);return@gesture}
    main.postDelayed({
     if(cancelled || !GestureService.inGame || !enabled){reset("Shot cancelled",false);return@postDelayed}
     val path=Path().apply{moveTo(a!!.x,a.y);lineTo(b!!.x,b.y)}
-    svc.gesture(path,650){shot->reset(if(shot)"Shot gesture sent; check game result" else "Shot gesture failed",shot)}
+    gestureSvc.gesture(path,650){shot->reset(if(shot)"Shot gesture sent; check game result" else "Shot gesture failed",shot)}
    },900)
   }
  }
